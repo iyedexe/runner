@@ -1,6 +1,7 @@
 #include "strategies/TriangularArb.h"
 #include "codegen/fix/OE/FixValues.h"
 #include "logger.hpp"
+#include "crypto/utils.hpp"
 
 TriangularArb::TriangularArb(const TriangularArbConfig& config)
     : config_(config)
@@ -10,7 +11,7 @@ TriangularArb::TriangularArb(const TriangularArbConfig& config)
     , risk_(config.risk)
 {
     LOG_INFO("[TriangularArb] Loading ED25519 key from: {}", config.ed25519KeyPath);
-    key_ = std::make_unique<crypto::ed25519>(config.ed25519KeyPath);
+    key_ = std::make_unique<crypto::ed25519>(readPemFile(config.ed25519KeyPath));
 
     LOG_INFO("[TriangularArb] Creating FIX Feeder");
     feeder_ = std::make_unique<TriArb::Feeder>(config.apiKey, *key_);
