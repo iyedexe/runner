@@ -1,0 +1,17 @@
+{
+  "name": "runner",
+  "version-string": "0.0.1",
+  "dependencies": [
+    "boost-asio",
+    "boost-beast",
+    "boost-property-tree",
+    "boost-system",
+    "fmt",
+    "libsodium",
+    "libxchange",
+    "nlohmann-json",
+    "openssl",
+    "prometheus-cpp",
+    "quill"
+  ]
+}

@@ -1,6 +1,6 @@
 #pragma once
 #include <string>
-#include "bnb/utils/SymbolFilter.h"
+#include "fin/SymbolFilter.h"
 
 class Symbol {
 private:

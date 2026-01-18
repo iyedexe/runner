@@ -1,70 +1,49 @@
-cmake_minimum_required(VERSION 3.10)
-project(RTEX)
+cmake_minimum_required(VERSION 3.20)
+project(runner LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
-set(JSON_ImplicitConversions OFF)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Find vcpkg packages
+find_package(Boost REQUIRED COMPONENTS system property_tree)
+find_package(OpenSSL REQUIRED)
+find_package(unofficial-sodium CONFIG REQUIRED)
+find_package(quill CONFIG REQUIRED)
+find_package(nlohmann_json REQUIRED)
+find_package(fmt CONFIG REQUIRED)
+find_package(prometheus-cpp CONFIG REQUIRED)
+find_package(libxchange CONFIG REQUIRED)
 
-SET(C20_WARNING_TEMPLATE_CDTOR_MUTE "-Wno-template-id-cdtor")
-SET(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} ${C20_WARNING_TEMPLATE_CDTOR_MUTE}")
-
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
-
-add_subdirectory(external/json)
-add_subdirectory(external/websocketpp)
-add_subdirectory(external/quill)
-add_subdirectory(external/fmt)
-add_subdirectory(external/prometheus)
-
-include_directories(include)
-include_directories(external/websocketpp)
-include_directories(external/websocketpp/asio)
-include_directories(external/json/single_include)
-include_directories(external/quill)
-include_directories(external/fmt)
-include_directories(external/prometheus)
-
-file(GLOB_RECURSE BNBCLIENTSOURCES "src/bnb/*.cpp")
-
+# Common sources
 set(COMMON_SOURCES
-    ${BNBCLIENTSOURCES}
-    src/common/WebSocketListener.cpp
     src/common/Scheduler.cpp
 )
 
-set(RECORDER_SOURCES
-    ${COMMON_SOURCES}
-    src/BNBRecorder.cpp
-    src/common/RecorderMonitor.cpp
-    src/recorder_main.cpp
-)
+# Trader sources
 set(TRADER_SOURCES
     ${COMMON_SOURCES}
-    src/strategies/CircularArb.cpp
+    src/strategies/TriangularArb.cpp
     src/strategies/IStrategy.cpp
-    src/bnb/utils/SymbolFilter.cpp
-    src/bnb/utils/ExchangeInfo.cpp
+    src/fix/Feeder.cpp
+    src/fix/Broker.cpp
     src/trader_main.cpp
 )
 
-find_package(Boost REQUIRED)
-find_package(OpenSSL REQUIRED)
-find_package(Sodium REQUIRED)
-
+# Common libraries
 set(COMMON_LIBS
-    ${Boost_LIBRARIES}
+    libxchange::libxchange
+    Boost::system
     OpenSSL::SSL
     OpenSSL::Crypto
+    unofficial-sodium::sodium
     quill::quill
+    nlohmann_json::nlohmann_json
     fmt::fmt
-    sodium
     prometheus-cpp::core
     prometheus-cpp::pull
 )
 
-
-add_executable(recorder ${RECORDER_SOURCES})
-target_link_libraries(recorder PRIVATE ${COMMON_LIBS})
-
+# Trader executable
 add_executable(trader ${TRADER_SOURCES})
+target_include_directories(trader PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(trader PRIVATE ${COMMON_LIBS})
