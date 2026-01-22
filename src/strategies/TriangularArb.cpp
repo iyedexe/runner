@@ -19,11 +19,17 @@ TriangularArb::TriangularArb(const TriangularArbConfig& config)
     LOG_INFO("[TriangularArb] Creating FIX Broker (liveMode={})", config.liveMode);
     broker_ = std::make_unique<TriArb::Broker>(config.apiKey, *key_, config.liveMode);
 
+    LOG_INFO("[TriangularArb] Creating REST client for: {}", config.restEndpoint);
+    restClient_ = std::make_unique<BNB::REST::ApiClient>(config.restEndpoint, config.apiKey, *key_);
+
     initialize();
 }
 
 void TriangularArb::initialize() {
     LOG_INFO("[TriangularArb] Initialized with starting coin: {}", startingAsset_);
+
+    // Fetch comprehensive symbol and filter data from REST API first
+    fetchExchangeInfo();
 
     LOG_INFO("[TriangularArb] Connecting FIX sessions...");
     feeder_->connect();
@@ -33,28 +39,14 @@ void TriangularArb::initialize() {
     feeder_->waitUntilConnected();
     broker_->waitUntilConnected();
 
-    LOG_INFO("[TriangularArb] FIX sessions connected, requesting instrument list");
-    feeder_->requestInstrumentList();
-    feeder_->waitForInstrumentList();
+    LOG_INFO("[TriangularArb] FIX sessions connected");
 
     discoverArbitrageRoutes();
 }
 
 void TriangularArb::discoverArbitrageRoutes() {
     LOG_INFO("[TriangularArb] Discovering arbitrage routes...");
-
-    auto symbolInfos = feeder_->getSymbols();
-    LOG_INFO("[TriangularArb] Received {} symbols from exchange", symbolInfos.size());
-
-    // Convert SymbolInfo to Symbol objects
-    symbolsList_.clear();
-    for (const auto& info : symbolInfos) {
-        if (!info.baseAsset.empty() && !info.quoteAsset.empty()) {
-            symbolsList_.push_back(createSymbol(info));
-        }
-    }
-
-    LOG_INFO("[TriangularArb] Converted {} valid symbols", symbolsList_.size());
+    LOG_INFO("[TriangularArb] Using {} symbols from exchange info", symbolsList_.size());
 
     // Compute arbitrage paths
     stratPaths_ = computeArbitragePaths(symbolsList_, startingAsset_, 3);
@@ -73,14 +65,91 @@ void TriangularArb::discoverArbitrageRoutes() {
     LOG_INFO("[TriangularArb] Found {} arbitrage paths using {} symbols",
              stratPaths_.size(), stratSymbols_.size());
 
+    // Fetch account balances from REST API
+    fetchAccountBalances();
+
     // Subscribe to market data
     if (!stratSymbols_.empty()) {
-        LOG_INFO("[TriangularArb] Subscribing to market data for {} symbols", stratSymbols_.size());
-        feeder_->subscribeToSymbols({stratSymbols_.begin(), stratSymbols_.end()});
-    }
+        // Set expected symbols in the store before subscribing
+        std::vector<std::string> symbolsVec(stratSymbols_.begin(), stratSymbols_.end());
+        feeder_->getMarketDataStore().setExpectedSymbols(symbolsVec);
 
-    // Initialize balances (placeholder - in real implementation would query account)
-    balance_[startingAsset_] = 100.0;  // Default starting balance for testing
+        LOG_INFO("[TriangularArb] Subscribing to market data for {} symbols", stratSymbols_.size());
+        feeder_->subscribeToSymbols(symbolsVec);
+
+        // Wait for all market data snapshots to arrive before starting
+        waitForMarketDataSnapshots();
+    }
+}
+
+void TriangularArb::fetchAccountBalances() {
+    LOG_INFO("[TriangularArb] Fetching account balances from REST API...");
+
+    try {
+        nlohmann::json response = restClient_->sendRequest(
+            BNB::REST::Endpoints::Account::AccountInformation()
+                .omitZeroBalances(true)
+        );
+
+        // Clear and rebuild balance map
+        balance_.clear();
+
+        if (!response.contains("balances")) {
+            LOG_WARNING("[TriangularArb] Account response missing 'balances' field");
+            return;
+        }
+
+        const auto& balances = response["balances"];
+        for (const auto& bal : balances) {
+            std::string asset = bal.value("asset", "");
+            double free = 0.0;
+
+            // Handle both string and number formats
+            if (bal.contains("free")) {
+                if (bal["free"].is_string()) {
+                    free = std::stod(bal["free"].get<std::string>());
+                } else {
+                    free = bal["free"].get<double>();
+                }
+            }
+
+            if (!asset.empty() && free > 0) {
+                balance_[asset] = free;
+                LOG_DEBUG("[TriangularArb] Balance: {} = {}", asset, free);
+            }
+        }
+
+        LOG_INFO("[TriangularArb] Loaded {} non-zero balances", balance_.size());
+
+        // Verify we have the starting asset
+        if (balance_.find(startingAsset_) == balance_.end()) {
+            LOG_WARNING("[TriangularArb] No balance found for starting asset: {}", startingAsset_);
+            balance_[startingAsset_] = 0.0;
+        } else {
+            LOG_INFO("[TriangularArb] Starting asset {} balance: {}", startingAsset_, balance_[startingAsset_]);
+        }
+
+    } catch (const std::exception& e) {
+        LOG_ERROR("[TriangularArb] Failed to fetch account balances: {}", e.what());
+        // Don't throw - strategy can still run with test balances
+        balance_[startingAsset_] = 0.0;
+    }
+}
+
+void TriangularArb::waitForMarketDataSnapshots() {
+    LOG_INFO("[TriangularArb] Waiting for market data snapshots...");
+
+    auto& store = feeder_->getMarketDataStore();
+
+    // Wait up to 30 seconds for all snapshots
+    bool success = store.waitForAllSnapshots(30000);
+
+    auto [received, expected] = store.getSnapshotProgress();
+    if (success) {
+        LOG_INFO("[TriangularArb] All market data snapshots received ({}/{})", received, expected);
+    } else {
+        LOG_WARNING("[TriangularArb] Timeout waiting for snapshots, received {}/{}", received, expected);
+    }
 }
 
 ::Symbol TriangularArb::createSymbol(const TriArb::SymbolInfo& info) {
@@ -90,6 +159,81 @@ void TriangularArb::discoverArbitrageRoutes() {
     }
     SymbolFilter filter(info.minQty, info.maxQty, info.stepSize, precision);
     return ::Symbol(info.baseAsset, info.quoteAsset, info.symbol, filter);
+}
+
+void TriangularArb::fetchExchangeInfo() {
+    LOG_INFO("[TriangularArb] Fetching exchange info from REST API...");
+
+    try {
+        // Request exchange info for all SPOT symbols
+        nlohmann::json response = restClient_->sendRequest(
+            BNB::REST::Endpoints::General::ExchangeInfo()
+                .permissions({"SPOT"})
+        );
+
+        // The response should have a "symbols" array
+        if (!response.contains("symbols")) {
+            LOG_ERROR("[TriangularArb] Exchange info response missing 'symbols' field");
+            return;
+        }
+
+        const auto& symbols = response["symbols"];
+        LOG_INFO("[TriangularArb] Parsing {} symbols from REST API exchange info", symbols.size());
+
+        // Clear and rebuild symbols list from exchange info (more precise than FIX)
+        symbolsList_.clear();
+        orderSizer_.clear();
+
+        int parsedCount = 0;
+        for (const auto& symbolData : symbols) {
+            if (!symbolData.contains("symbol") || !symbolData.contains("filters")) {
+                continue;
+            }
+
+            // Skip non-TRADING symbols
+            if (symbolData.contains("status") && symbolData["status"].get<std::string>() != "TRADING") {
+                continue;
+            }
+
+            std::string symbolStr = symbolData["symbol"].get<std::string>();
+            std::string baseAsset = symbolData.value("baseAsset", "");
+            std::string quoteAsset = symbolData.value("quoteAsset", "");
+
+            if (baseAsset.empty() || quoteAsset.empty()) {
+                continue;
+            }
+
+            // Parse comprehensive filters from the JSON
+            SymbolFilters filters = SymbolFilters::fromJson(symbolData["filters"]);
+            orderSizer_.addSymbol(symbolStr, filters);
+
+            // Create Symbol object with basic filter for backward compatibility
+            SymbolFilter basicFilter(
+                filters.lotSize().minQty,
+                filters.lotSize().maxQty,
+                filters.lotSize().stepSize,
+                filters.qtyPrecision()
+            );
+            symbolsList_.emplace_back(baseAsset, quoteAsset, symbolStr, basicFilter);
+
+            parsedCount++;
+
+            LOG_DEBUG("[TriangularArb] Loaded {}: "
+                     "priceFilter(tick={}), lotSize(min={}, max={}, step={})",
+                     symbolStr,
+                     filters.priceFilter().tickSize,
+                     filters.lotSize().minQty,
+                     filters.lotSize().maxQty,
+                     filters.lotSize().stepSize);
+        }
+
+        LOG_INFO("[TriangularArb] Successfully loaded {} symbols from exchange info",
+                 parsedCount);
+
+    } catch (const std::exception& e) {
+        LOG_ERROR("[TriangularArb] Failed to fetch exchange info: {}", e.what());
+        throw;
+    }
 }
 
 void TriangularArb::shutdown() {
@@ -127,6 +271,7 @@ TriangularArbConfig TriangularArb::loadConfig(const std::string& configFile) {
         config.fixMdPort = pt.get<int>("FIX_CONNECTION.mdPort", 9000);
         config.fixOeEndpoint = pt.get<std::string>("FIX_CONNECTION.oeEndpoint", "fix-oe.testnet.binance.vision");
         config.fixOePort = pt.get<int>("FIX_CONNECTION.oePort", 9000);
+        config.restEndpoint = pt.get<std::string>("FIX_CONNECTION.restEndpoint", "testnet.binance.vision");
         config.apiKey = pt.get<std::string>("FIX_CONNECTION.apiKey");
         config.ed25519KeyPath = pt.get<std::string>("FIX_CONNECTION.ed25519KeyPath");
 
@@ -226,59 +371,141 @@ std::optional<Signal> TriangularArb::evaluatePath(std::vector<Order>& path) {
 
     LOG_DEBUG("[TriangularArb] Evaluating path: {}", pathDescription);
 
-    double startingAssetQty = 0;
-    double resultingAssetQty = risk_ * balance_[pathStartingAsset];
+    // Get current balance for the starting asset
+    auto balanceIt = balance_.find(pathStartingAsset);
+    if (balanceIt == balance_.end() || balanceIt->second <= 0) {
+        LOG_DEBUG("[TriangularArb] No balance for starting asset {}", pathStartingAsset);
+        return std::nullopt;
+    }
+
+    // Initial stake based on holdings and risk factor
+    double initialStake = risk_ * balanceIt->second;
+    double currentAmount = initialStake;  // Amount available for next leg
 
     for (auto& order : path) {
-        startingAssetQty = resultingAssetQty;
-
-        if (startingAssetQty == 0) {
-            LOG_DEBUG("[TriangularArb] Starting asset qty for {} is null, cannot proceed",
-                     order.getStartingAsset());
+        if (currentAmount <= 0) {
+            LOG_DEBUG("[TriangularArb] Current amount is zero/negative, cannot proceed");
             return std::nullopt;
         }
 
-        auto it = marketData_.find(order.getSymbol().to_str());
-        if (it == marketData_.end()) {
-            LOG_DEBUG("[TriangularArb] Market data unavailable for [{}]", order.getSymbol().to_str());
-            return std::nullopt;
-        }
+        std::string symbolStr = order.getSymbol().to_str();
 
-        const MarketData& marketData = it->second;
+        // Query the MarketDataStore for the latest prices
+        MarketData marketData = feeder_->getMarketDataStore().get(symbolStr);
 
         if (marketData.bestBidPrice <= 0 || marketData.bestAskPrice <= 0) {
-            LOG_DEBUG("[TriangularArb] Invalid prices for [{}]", order.getSymbol().to_str());
+            LOG_DEBUG("[TriangularArb] Invalid prices for [{}]: bid={}, ask={}",
+                     symbolStr, marketData.bestBidPrice, marketData.bestAskPrice);
             return std::nullopt;
         }
 
         double orderPrice = 0;
         double orderQty = 0;
+        double resultingAmount = 0;
+
+        bool useOrderSizer = orderSizer_.hasSymbol(symbolStr);
 
         if (order.getWay() == Way::SELL) {
-            orderQty = order.getSymbol().getFilter().roundQty(startingAssetQty);
-            resultingAssetQty = orderQty * marketData.bestBidPrice;
+            // SELL: we have base asset, want quote asset
+            // currentAmount is in base asset units
             orderPrice = marketData.bestBidPrice;
-        }
-        if (order.getWay() == Way::BUY) {
-            orderQty = order.getSymbol().getFilter().roundQty(startingAssetQty / marketData.bestAskPrice);
-            resultingAssetQty = orderQty;
+
+            // Round quantity to valid step size
+            if (useOrderSizer) {
+                orderQty = orderSizer_.roundQuantity(symbolStr, currentAmount, true);
+            } else {
+                orderQty = order.getSymbol().getFilter().roundQty(currentAmount);
+            }
+
+            // Validate and adjust if needed
+            if (useOrderSizer) {
+                auto adjusted = orderSizer_.adjustOrder(symbolStr, orderPrice, orderQty, true, orderPrice);
+
+                // If quantity doesn't meet filters, try reducing
+                int reductionAttempts = 0;
+                while (!adjusted.validation && reductionAttempts < 5) {
+                    // Reduce quantity by step size
+                    double stepSize = orderSizer_.getFilters(symbolStr).lotSize().stepSize;
+                    if (stepSize <= 0) stepSize = orderQty * 0.01;  // 1% reduction fallback
+                    orderQty -= stepSize;
+                    orderQty = orderSizer_.roundQuantity(symbolStr, orderQty, true);
+
+                    if (orderQty <= 0) break;
+                    adjusted = orderSizer_.adjustOrder(symbolStr, orderPrice, orderQty, true, orderPrice);
+                    reductionAttempts++;
+                }
+
+                if (!adjusted.validation) {
+                    LOG_DEBUG("[TriangularArb] SELL order validation failed for {}: {}", symbolStr, adjusted.validation.reason);
+                    return std::nullopt;
+                }
+                orderQty = adjusted.quantity;
+            }
+
+            // Result: we get quote asset
+            resultingAmount = orderQty * orderPrice;
+
+        } else {  // Way::BUY
+            // BUY: we have quote asset, want base asset
+            // currentAmount is in quote asset units
             orderPrice = marketData.bestAskPrice;
+
+            // Calculate how much base asset we can buy with our quote asset
+            double rawQty = currentAmount / orderPrice;
+
+            // Round quantity to valid step size
+            if (useOrderSizer) {
+                orderQty = orderSizer_.roundQuantity(symbolStr, rawQty, true);
+            } else {
+                orderQty = order.getSymbol().getFilter().roundQty(rawQty);
+            }
+
+            // Validate and adjust if needed
+            if (useOrderSizer) {
+                auto adjusted = orderSizer_.adjustOrder(symbolStr, orderPrice, orderQty, true, orderPrice);
+
+                // If quantity doesn't meet filters, try reducing
+                int reductionAttempts = 0;
+                while (!adjusted.validation && reductionAttempts < 5) {
+                    // Reduce quantity by step size
+                    double stepSize = orderSizer_.getFilters(symbolStr).lotSize().stepSize;
+                    if (stepSize <= 0) stepSize = orderQty * 0.01;  // 1% reduction fallback
+                    orderQty -= stepSize;
+                    orderQty = orderSizer_.roundQuantity(symbolStr, orderQty, true);
+
+                    if (orderQty <= 0) break;
+                    adjusted = orderSizer_.adjustOrder(symbolStr, orderPrice, orderQty, true, orderPrice);
+                    reductionAttempts++;
+                }
+
+                if (!adjusted.validation) {
+                    LOG_DEBUG("[TriangularArb] BUY order validation failed for {}: {}", symbolStr, adjusted.validation.reason);
+                    return std::nullopt;
+                }
+                orderQty = adjusted.quantity;
+            }
+
+            // Result: we get base asset
+            resultingAmount = orderQty;
         }
 
-        LOG_DEBUG("[TriangularArb] Transaction: {} {} -> {} {}",
-                 startingAssetQty, order.getStartingAsset(),
-                 resultingAssetQty, order.getResultingAsset());
+        LOG_DEBUG("[TriangularArb] Transaction: {} {} -> {} {} (price={}, qty={})",
+                 currentAmount, order.getStartingAsset(),
+                 resultingAmount, order.getResultingAsset(),
+                 orderPrice, orderQty);
 
         order.setPrice(orderPrice);
         order.setQty(orderQty);
         order.setType(OrderType::MARKET);
 
-        double fee = getFeeForSymbol(order.getSymbol().to_str());
-        resultingAssetQty *= (1 - fee / 100);
-        LOG_DEBUG("[TriangularArb] Amount after fees ({}%): {}", fee, resultingAssetQty);
+        // Apply fee and propagate to next leg
+        double fee = getFeeForSymbol(symbolStr);
+        currentAmount = resultingAmount * (1 - fee / 100);
+        LOG_DEBUG("[TriangularArb] Amount after fees ({}%): {}", fee, currentAmount);
     }
 
-    double pnl = resultingAssetQty - risk_ * balance_[pathStartingAsset];
+    // Calculate PnL: final amount minus initial stake
+    double pnl = currentAmount - initialStake;
     if (pnl > 0) {
         return Signal(path, pathDescription, pnl);
     }
@@ -286,7 +513,8 @@ std::optional<Signal> TriangularArb::evaluatePath(std::vector<Order>& path) {
 }
 
 std::optional<Signal> TriangularArb::onMarketData(const MarketData& data) {
-    marketData_[data.symbol] = data;
+    // Market data is now stored only in MarketDataStore (via Feeder)
+    // No local cache - always query the store for latest prices
 
     double maxPnl = 0;
     std::optional<Signal> outSignal;
@@ -316,6 +544,24 @@ void TriangularArb::executeArbitrage(const Signal& signal) {
         char side = (order.getWay() == Way::BUY) ? FIX::OE::Side_BUY : FIX::OE::Side_SELL;
         std::string symbol = order.getSymbol().to_str();
         double qty = order.getQty();
+        double price = order.getPrice();
+
+        // Use OrderSizer to validate and potentially adjust the order
+        if (orderSizer_.hasSymbol(symbol)) {
+            auto adjusted = orderSizer_.adjustOrder(symbol, price, qty, true);  // true = market order
+
+            if (!adjusted.validation) {
+                LOG_ERROR("[TriangularArb] Order validation failed for {}: {}, skipping",
+                         symbol, adjusted.validation.reason);
+                continue;
+            }
+
+            if (adjusted.wasAdjusted) {
+                LOG_INFO("[TriangularArb] Order adjusted for {}: qty {} -> {}",
+                        symbol, qty, adjusted.quantity);
+                qty = adjusted.quantity;
+            }
+        }
 
         LOG_INFO("[TriangularArb] Submitting order: {} {} @ MARKET, qty={}",
                  (side == FIX::OE::Side_BUY ? "BUY" : "SELL"), symbol, qty);

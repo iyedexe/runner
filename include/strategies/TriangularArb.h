@@ -20,10 +20,16 @@
 
 #include "IStrategy.h"
 #include "fin/SymbolFilter.h"
+#include "fin/SymbolFilters.h"
+#include "fin/OrderSizer.h"
 #include "fin/Order.h"
 #include "fin/Symbol.h"
 #include "fin/Signal.h"
 
+#include "rest/ApiClient.hpp"
+#include "rest/requests/endpoints/General.hpp"
+#include "rest/requests/endpoints/Account.hpp"
+#include "rest/requests/endpoints/Trading.hpp"
 #include "crypto/ed25519.hpp"
 
 struct TriangularArbConfig {
@@ -32,6 +38,7 @@ struct TriangularArbConfig {
     int fixMdPort = 9000;
     std::string fixOeEndpoint;
     int fixOePort = 9000;
+    std::string restEndpoint = "testnet.binance.vision";  // REST API endpoint for exchange info
     std::string apiKey;
     std::string ed25519KeyPath;
     double defaultFee = 0.1;  // Default fee percentage for symbols not in symbolFees
@@ -57,13 +64,16 @@ private:
     std::unique_ptr<crypto::ed25519> key_;
     std::unique_ptr<TriArb::Feeder> feeder_;
     std::unique_ptr<TriArb::Broker> broker_;
+    std::unique_ptr<BNB::REST::ApiClient> restClient_;
 
     std::string startingAsset_;
     std::vector<std::vector<Order>> stratPaths_;
     std::set<std::string> stratSymbols_;
-    std::map<std::string, MarketData> marketData_;
-    std::map<std::string, double> balance_;
+    std::map<std::string, double> balance_;  // Account holdings per asset
     std::vector<::Symbol> symbolsList_;
+
+    // Order sizing and filter validation
+    OrderSizer orderSizer_;
 
     double defaultFee_;
     std::map<std::string, double> symbolFees_;
@@ -72,6 +82,9 @@ private:
     double getFeeForSymbol(const std::string& symbol) const;
 
     void discoverArbitrageRoutes();
+    void fetchExchangeInfo();    // Fetch filters from REST API
+    void fetchAccountBalances(); // Fetch account holdings from REST API
+    void waitForMarketDataSnapshots();  // Wait for all subscribed symbols to receive snapshots
     std::vector<Order> getPossibleOrders(const std::string& coin, const std::vector<::Symbol>& relatedSymbols);
     std::vector<std::vector<Order>> computeArbitragePaths(const std::vector<::Symbol>& symbolsList, const std::string& startingAsset, int arbitrageDepth);
     std::optional<Signal> evaluatePath(std::vector<Order>& path);

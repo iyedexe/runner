@@ -28,7 +28,14 @@ void Feeder::subscribeToSymbols(const std::vector<std::string>& symbols) {
     LOG_INFO("[Feeder] Subscribing to {} symbols", symbols.size());
 
     std::string reqId = "mdReq" + std::to_string(++mdReqIdCounter_);
-    MarketDataRequest request(reqId);
+
+    // Track which symbols are associated with this subscription request
+    {
+        std::lock_guard<std::mutex> lock(subscriptionMtx_);
+        subscriptionSymbols_[reqId] = symbols;
+    }
+
+    MarketDataRequest request(reqId, SubscriptionAction::Subscribe);
     request.subscribeToStream(StreamType::BookTicker);
     request.setMarketDepth(1);
 
@@ -40,8 +47,44 @@ void Feeder::subscribeToSymbols(const std::vector<std::string>& symbols) {
 }
 
 void Feeder::unsubscribeFromSymbols(const std::vector<std::string>& symbols) {
+    if (symbols.empty()) {
+        LOG_WARNING("[Feeder] No symbols to unsubscribe from");
+        return;
+    }
+
     LOG_INFO("[Feeder] Unsubscribing from {} symbols", symbols.size());
-    // TODO: Implement unsubscribe using SubscriptionRequestType_UNSUBSCRIBE
+
+    // Find the request ID associated with these symbols
+    std::string reqIdToUnsubscribe;
+    {
+        std::lock_guard<std::mutex> lock(subscriptionMtx_);
+        for (const auto& [reqId, subSymbols] : subscriptionSymbols_) {
+            // Check if any of the symbols to unsubscribe match
+            for (const auto& sym : symbols) {
+                if (std::find(subSymbols.begin(), subSymbols.end(), sym) != subSymbols.end()) {
+                    reqIdToUnsubscribe = reqId;
+                    break;
+                }
+            }
+            if (!reqIdToUnsubscribe.empty()) break;
+        }
+    }
+
+    if (reqIdToUnsubscribe.empty()) {
+        LOG_WARNING("[Feeder] No active subscription found for symbols to unsubscribe");
+        return;
+    }
+
+    // Send unsubscribe request with the same reqId
+    MarketDataRequest request(reqIdToUnsubscribe, SubscriptionAction::Unsubscribe);
+    request.setMarketDepth(1);  // Required for unsubscribe
+    sendMessage(request);
+
+    // Remove from tracking
+    {
+        std::lock_guard<std::mutex> lock(subscriptionMtx_);
+        subscriptionSymbols_.erase(reqIdToUnsubscribe);
+    }
 }
 
 MarketData Feeder::getUpdate() {
@@ -91,6 +134,10 @@ void Feeder::onMessage(const FIX44::MD::MarketDataSnapshot& message, const FIX::
     // Use libxchange parser
     auto update = BNB::FIX::MarketDataParser::parseSnapshot(message);
 
+    LOG_DEBUG("[Feeder] Received snapshot for {}: bid={}/{}, ask={}/{}",
+              update.symbol, update.bestBidPrice, update.bestBidQty,
+              update.bestAskPrice, update.bestAskQty);
+
     // Convert to runner's MarketData type
     MarketData data;
     data.symbol = update.symbol;
@@ -99,6 +146,10 @@ void Feeder::onMessage(const FIX44::MD::MarketDataSnapshot& message, const FIX::
     data.bestAskPrice = update.bestAskPrice;
     data.bestAskQty = update.bestAskQty;
 
+    // Update the market data store (this is the primary storage)
+    marketDataStore_.onSnapshot(data);
+
+    // Also queue for backward compatibility with existing strategy flow
     queueMarketData(data);
 }
 
@@ -106,7 +157,25 @@ void Feeder::onMessage(const FIX44::MD::MarketDataIncrementalRefresh& message, c
     // Use libxchange parser
     auto updates = BNB::FIX::MarketDataParser::parseIncrementalRefresh(message);
 
-    // Convert to runner's MarketData type and queue all updates
+    // Process each update
+    for (const auto& update : updates) {
+        LOG_DEBUG("[Feeder] Received incremental update for {}: bid={}/{}, ask={}/{}",
+                  update.symbol, update.bestBidPrice, update.bestBidQty,
+                  update.bestAskPrice, update.bestAskQty);
+
+        // Convert to runner's MarketData type
+        MarketData data;
+        data.symbol = update.symbol;
+        data.bestBidPrice = update.bestBidPrice;
+        data.bestBidQty = update.bestBidQty;
+        data.bestAskPrice = update.bestAskPrice;
+        data.bestAskQty = update.bestAskQty;
+
+        // Update the market data store (merges with existing data)
+        marketDataStore_.onIncrementalUpdate(data);
+    }
+
+    // Also queue for backward compatibility
     {
         std::lock_guard<std::mutex> lock(queueMtx_);
         for (const auto& update : updates) {

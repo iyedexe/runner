@@ -22,6 +22,7 @@ set(COMMON_SOURCES
 # Trader sources
 set(TRADER_SOURCES
     ${COMMON_SOURCES}
+    src/fin/SymbolFilters.cpp
     src/strategies/TriangularArb.cpp
     src/strategies/IStrategy.cpp
     src/fix/Feeder.cpp
