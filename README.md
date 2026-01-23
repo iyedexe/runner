@@ -1,232 +1,273 @@
-# RTEX
-A low latency crypto trading system.   
-using c++ and websockets, connections are implemented through message queues and asio selects for the fastest and most reliable data transfer.  
-The aim is a framework that allows recording market data, backtesting trading strategies, live running and monitoring.
+# RTEX - Triangular Arbitrage Trading System
 
-# What's inside?
-market data recorder, supports binance exchange for now.  
-live trader that loads a strategy a d runs it as per market events.  
-a backtester that determines several metrics about a strategy in a specified time frame.   
+A low-latency cryptocurrency trading system for triangular arbitrage on Binance, implemented in C++ with FIX protocol connectivity.
 
-# Progress
-## Recorder: 
-So far the recorder is ready, subscribing to market data streams and recording them into flat csv files for future usage.    
-It also exposes the recording metrics on a prometheus client page to be scrapped and analyzed.   
-## LiveTrader:
-The circular arbitrage strategy has been implemented, not yet tested nor backtested.   
-Still missing core components.   
+## Strategy Overview
 
-# Next steps.
-[BNBBROKER] Implement ED25519 and RSA auth on message sign for BNB Broker.   
-[FIXBROKER] Add fix connector to binance.     
-[BNBBROKER] Implement full binance API.  
-[BNBFEEDER] Templated feeder.  
-[BNBRECORDER] Fix recorder.    
-[BNBRECORDER] Generic Recorder for MDframes.   
-[STRATEGY] Generic Istrategy onmarket data handler.  
-[UTILS] add a serializer for enum types (check wih boost).    
-Config file base recorder monitor port and configuration.   
-Add into recorder configuration, recording of related symbols to certain coins.     
-Find a method to bypass binance streams limitations.     
-Archive recoding files bz2 and send to a datalake to be queried from a webinterface.   
-Add unit tests.  
+The system executes **triangular arbitrage** - exploiting price inefficiencies across three trading pairs that form a cycle back to the starting asset.
 
-# Done.
-[BNBBROKER] Add place order.   
-[BNBBROKER] Refactor requests hirerachy.   
-[STRATEGY] get market data snapshot on startup
-[BROKER] HMAC message sign for user data and trading
-[STRATEGY] Get account balances and store in circular arb strategy.    
-[SYMBOL] Symbol filter parse and refactor factory.      
-[STRATEGY] round sizes and prices using filters.   
-[STRATEGY] Signal add prices and sizes.   
-Refactor scheduler for less functions.   
-Refactor BNB Broker to pass methods for calls to API.    
-Investigate crashes at recorder (feeder) after a few hours run and add retry protocol.  
-Impelment a recovery mechanism in case of crash for feeder.   
-Replace logging library with Quill for perf : https://github.com/odygrd/quill?tab=readme-ov-file#-table-of-contents.   
+### Example
 
-# How to use ?
-
-## Run the recorder
+Starting with USDT, if the following trades yield more than 100 USDT:
 ```
-/recorder --symbol all --date 2024-09-21 --configfile ../config/test_config.ini 
+100 USDT → BUY BTC/USDT → 0.001 BTC → SELL BTC/ETH → 0.05 ETH → SELL ETH/USDT → 100.05 USDT
 ```
+The 0.05 USDT profit (minus fees) represents an arbitrage opportunity.
 
-## Run the trader
-```
-./trader --configfile ../config/trader_config.ini --strategy CircularArb
-```
+### Execution Flow
 
-# But before setup the project !
-## Install dependecies (Fedora instructions) :
-Installation on debian varies so be careful on package names and install commands.   
+1. **Initialization**: Fetch exchange info (symbols, filters, fees) via REST API
+2. **Route Discovery**: Compute all valid 3-leg arbitrage paths for the starting asset
+3. **Market Data**: Subscribe to best bid/ask (BookTicker) via FIX for all relevant symbols
+4. **Detection**: On each market data update:
+   - Fast matrix evaluation screens all paths for approximate profitability
+   - Top-K candidates undergo detailed validation (filters, rounding, fees)
+   - Version counter ensures prices haven't changed during evaluation
+5. **Execution**: If profitable path found, execute three market orders sequentially
+
+## Architecture
 
 ```
-sudo dnf update -y
-sudo dnf install -y git cmake python gcc java-devel pip
-sudo pip install numpy
-```
-### Install bazel
-```
-sudo yum install -y java-1.8.0-openjdk-devel wget
-wget https://github.com/bazelbuild/bazel/releases/download/5.4.0/bazel-5.4.0-installer-linux-x86_64.sh
-chmod +x bazel-5.4.0-installer-linux-x86_64.sh
-sudo ./bazel-5.4.0-installer-linux-x86_64.sh
-```
-
-### Download tensor_flow_cc
-```
-git clone https://github.com/FloopCZ/tensorflow_cc.git
-cd tensorflow_cc/tensorflow_cc
-```
-
-### Install tensor_flow_cc
-```
-cd tensorflow_cc
-mkdir build && cd build
-cmake ..
-make
-sudo make install
-sudo ldconfig
-```
-
-### Install boost 
-```
-get bz2 from https://github.com/boostorg/boost/releases/tag/boost-1.86.0/boost-1.86.0-b2-nodocs.tar.gz 
-tar -xzvf boost-1.86.0-b2-nodocs.tar.gz 
-cd boost-1.86.0-b2-nodocs
-sudo ./bootstrap
-sudo ./b2 install
-```
-
-### Install openssl
-
-```
-sudo dnf install perl
-wget https://www.openssl.org/source/openssl-3.3.1g.tar.gz
-tar -xzvf openssl-1.1.1g.tar.gz
-cd openssl-1.1.1g
-./config
-make
-make test
-sudo make install
-```
-
-### Install libsodium
-```
-wget https://download.libsodium.org/libsodium/releases/libsodium-1.0.20-stable.tar.gz 
-./configure
-make && make check
-sudo make install
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              INITIALIZATION                                  │
+│  REST API → Exchange Info (symbols, filters) → Account Balances             │
+│  FIX Connect → Feeder (MD) + Broker (OE) → Subscribe to BookTicker          │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           MARKET DATA PIPELINE                               │
+│                                                                              │
+│  ┌─────────────┐    ┌──────────────────┐    ┌────────────────────┐          │
+│  │ FIX Feeder  │───▶│ MarketDataStore  │───▶│  CoalescingBuffer  │          │
+│  │ (messages)  │    │ (bid/ask + ver#) │    │ (latest per symbol)│          │
+│  └─────────────┘    └──────────────────┘    └─────────┬──────────┘          │
+│                                                       │                      │
+└───────────────────────────────────────────────────────┼──────────────────────┘
+                                                        │
+                                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           SIGNAL DETECTION                                   │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────┐        │
+│  │              Stage 1: Matrix Path Evaluation                     │        │
+│  │  • Pre-computed coefficients (symbol indices, bid/ask flags)     │        │
+│  │  • O(n) approximate PnL for ALL paths                            │        │
+│  │  • Filter: keep paths where PnL > 0                              │        │
+│  └──────────────────────────────┬──────────────────────────────────┘        │
+│                                 │ Top-K candidates                           │
+│                                 ▼                                            │
+│  ┌─────────────────────────────────────────────────────────────────┐        │
+│  │              Stage 2: Sequential Validation                      │        │
+│  │  • Query current bid/ask prices                                  │        │
+│  │  • Apply exchange filters (LOT_SIZE, NOTIONAL, etc.)             │        │
+│  │  • Round quantities to valid step sizes                          │        │
+│  │  • Calculate exact PnL after fees                                │        │
+│  │  • Staleness check (version counter) - abort if data changed     │        │
+│  └──────────────────────────────┬──────────────────────────────────┘        │
+│                                 │ Best validated signal                      │
+└─────────────────────────────────┼───────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           ORDER EXECUTION                                    │
+│                                                                              │
+│  For each order in path (sequentially):                                      │
+│    1. Validate order against exchange filters                                │
+│    2. Submit MARKET order via FIX Broker                                     │
+│    3. Wait for fill confirmation (5s timeout)                                │
+│    4. Abort if order not filled                                              │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Install ZLIB and CURL
-```
-Fedora :
-sudo dnf install zlib-devel zlib-static curl libcurl-devel
-Debian: 
-sudo apt-get install zlib1g-dev curl libcurl4-openssl-dev
+## Key Components
 
-```
+### Market Data Handling
 
-### Update submodules
-```
-git submodule update --init --recursive
-```
+| Component | File | Purpose |
+|-----------|------|---------|
+| **Feeder** | `include/fix/Feeder.h` | FIX Market Data handler, parses snapshots/incremental updates |
+| **MarketDataStore** | `include/fix/MarketDataStore.h` | Thread-safe bid/ask storage with atomic version counter |
+| **CoalescingBuffer** | `include/fix/CoalescingBuffer.h` | Batches updates, keeps only latest per symbol |
 
-### Build project
-```
-mkdir build && cd build
-cmake ..
-make
-```
+### Strategy Logic
 
-# References :
-https://wiki.hanzheteng.com/development/cmake/cmake-find_package.  
-https://medium.com/@TomPJacobs/c-tensorflow-a-journey-bdecbbdd0f65.  
-https://medium.com/@yurh/installing-prometheus-grafana-as-services-with-simple-bash-script-7a7488fc8afe.   
-https://dev.to/tythos/cmake-and-git-submodules-more-advanced-cases-2ka.  
-https://dane-bulat.medium.com/.   vim-setting-up-a-build-system-and-code-completion-for-c-and-c-eb263c0a19a1.     
-* Binance spot WS streams api :  
-https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams.   
-* Binance spot WS api :  
-https://developers.binance.com/docs/binance-spot-api-docs/web-socket-api.  
+| Component | File | Purpose |
+|-----------|------|---------|
+| **TriangularArb** | `include/strategies/TriangularArb.h` | Main strategy class - initialization, detection, execution |
+| **MatrixPathEvaluator** | `include/strategies/MatrixPathEvaluator.h` | Fast O(n) path screening with pre-computed coefficients |
+| **OrderSizer** | `include/fin/OrderSizer.h` | Validates and rounds orders to exchange filter requirements |
+| **SymbolFilters** | `include/fin/SymbolFilters.h` | Parses and applies Binance filter rules (LOT_SIZE, NOTIONAL, etc.) |
 
-# Submodules:
-```
-* https://github.com/zaphoyd/websocketpp  
-* https://github.com/nlohmann/json  
-* https://github.com/gabime/spdlog
-```
+### Order Management
 
-# Issues 
+| Component | File | Purpose |
+|-----------|------|---------|
+| **Broker** | `include/fix/Broker.h` | FIX Order Entry handler, submits orders and tracks execution |
 
-https://gcc.gnu.org/onlinedocs/gcc-14.2.0/gcc/C_002b_002b-Dialect-Options.html#index-Wno-template-id-cdtor
+## Matrix Path Evaluation
 
-GCC=14
-BAZEL=5.4
+The `MatrixPathEvaluator` provides fast approximate PnL computation by pre-computing path coefficients at initialization.
 
-Error1.:  
-```
-ERROR: /home/iyedexe/.cache/bazel/_bazel_iyedexe/c86f93f3eb14ecfc0e9baa2126cdf78f/external/com_google_absl/absl/strings/BUILD.bazel:1078:11: Compiling absl/strings/internal/str_format/extension.cc failed: (Exit 1): gcc failed: error executing command /usr/bin/gcc -U_FORTIFY_SOURCE -fstack-protector -Wall -Wunused-but-set-parameter -Wno-free-nonheap-object -fno-omit-frame-pointer -g0 -O2 '-D_FORTIFY_SOURCE=1' -DNDEBUG -ffunction-sections ... (remaining 38 arguments skipped)
-In file included from external/com_google_absl/absl/strings/internal/str_format/extension.cc:16:
-external/com_google_absl/absl/strings/internal/str_format/extension.h:34:33: error: found ':' in nested-name-specifier, expected '::'
-   34 | enum class FormatConversionChar : uint8_t;
+### Pre-computed Coefficients
+
+For each arbitrage path, we store:
+- **Symbol indices**: Map symbol names to array indices for O(1) price lookup
+- **Bid/Ask flags**: `true` for SELL (use bid), `false` for BUY (use ask)
+- **Fee multiplier**: Product of `(1 - fee/100)` for all legs
+
+### Evaluation Algorithm
+
+```cpp
+for each path:
+    amount = initial_stake
+    for each leg:
+        if SELL:
+            amount = amount * bid_price[leg]   // base → quote
+        else: // BUY
+            amount = amount / ask_price[leg]   // quote → base
+    amount *= fee_multiplier
+    pnl = amount - initial_stake
 ```
 
-Error1.1:   
+This ignores filter validation for speed - detailed validation happens only for top-K candidates.
+
+## Staleness Detection
+
+The `MarketDataStore` maintains an atomic version counter incremented on every update. During path evaluation:
+
+1. Capture version at start: `startVersion = store.version()`
+2. After each leg, check: `if (store.version() != startVersion) abort`
+
+This prevents executing on stale prices when market data changes during multi-leg evaluation.
+
+## Configuration
+
+Create an INI file (see `config/test_config.ini` for example):
+
+```ini
+[TRIANGULAR_ARB_STRATEGY]
+# Asset to start and end arbitrage cycles with
+startingAsset=USDT
+
+# Default trading fee percentage (0.1 = 0.1%)
+defaultFee=0.1
+
+# Percentage of balance to use per arbitrage (1.0 = 100%)
+risk=1.0
+
+# true = send real orders, false = simulate fills
+liveMode=false
+
+[FIX_CONNECTION]
+# FIX Market Data endpoint
+mdEndpoint=fix-md.testnet.binance.vision
+mdPort=9000
+
+# FIX Order Entry endpoint
+oeEndpoint=fix-oe.testnet.binance.vision
+oePort=9000
+
+# REST API endpoint (for exchange info and account data)
+restEndpoint=testnet.binance.vision
+
+# API credentials
+apiKey=YOUR_API_KEY
+ed25519KeyPath=config/your_key.pem
+
+[SYMBOL_FEES]
+# Optional per-symbol fee overrides (e.g., for BNB discount)
+BNBUSDT=0.075
+BNBBTC=0.075
 ```
-ERROR: /home/iyedexe/.cache/bazel/_bazel_iyedexe/c86f93f3eb14ecfc0e9baa2126cdf78f/external/llvm-project/llvm/BUILD.bazel:178:11: Compiling llvm/lib/Support/Signals.cpp failed: (Exit 1): gcc failed: error executing command /usr/bin/gcc -U_FORTIFY_SOURCE -fstack-protector -Wall -Wunused-but-set-parameter -Wno-free-nonheap-object -fno-omit-frame-pointer -g0 -O2 '-D_FORTIFY_SOURCE=1' -DNDEBUG -ffunction-sections ... (remaining 77 arguments skipped)
-In file included from external/llvm-project/llvm/lib/Support/Signals.cpp:14:
-external/llvm-project/llvm/include/llvm/Support/Signals.h:119:8: error: variable or field 'CleanupOnSignal' declared void
-  119 |   void CleanupOnSignal(uintptr_t Context);
-      |        ^~~~~~~~~~~~~~~
+
+### Configuration Parameters
+
+| Section | Parameter | Description | Default |
+|---------|-----------|-------------|---------|
+| `TRIANGULAR_ARB_STRATEGY` | `startingAsset` | Base asset for arbitrage cycles | Required |
+| | `defaultFee` | Default fee % for all symbols | 0.1 |
+| | `risk` | Fraction of balance to use | 1.0 |
+| | `liveMode` | Enable live trading | false |
+| `FIX_CONNECTION` | `mdEndpoint` | FIX Market Data server | Required |
+| | `mdPort` | FIX MD port | 9000 |
+| | `oeEndpoint` | FIX Order Entry server | Required |
+| | `oePort` | FIX OE port | 9000 |
+| | `restEndpoint` | REST API endpoint | Required |
+| | `apiKey` | API key | Required |
+| | `ed25519KeyPath` | Path to ED25519 private key | Required |
+| `SYMBOL_FEES` | `<SYMBOL>` | Per-symbol fee override | - |
+
+## Building
+
+```bash
+# Configure with vcpkg toolchain
+cmake --preset release
+
+# Build
+cmake --build build/release
+
+# The binary will be at build/release/trader
 ```
 
-Error1.2:   
-```
-ERROR: /home/iyedexe/workbench/tensorflow_cc/tensorflow_cc/build/tensorflow/tensorflow/core/lib/io/BUILD:207:11: Compiling tensorflow/core/lib/io/cache.cc failed: (Exit 1): gcc failed: error executing command /usr/bin/gcc -U_FORTIFY_SOURCE -fstack-protector -Wall -Wunused-but-set-parameter -Wno-free-nonheap-object -fno-omit-frame-pointer -g0 -O2 '-D_FORTIFY_SOURCE=1' -DNDEBUG -ffunction-sections ... (remaining 49 arguments skipped)
-In file included from tensorflow/core/lib/io/cache.cc:16:
-./tensorflow/core/lib/io/cache.h:99:11: error: 'uint64_t' does not name a type
-   99 |   virtual uint64_t NewId() = 0;
-      |           ^~~~~~~~
+## Running
+
+```bash
+./trader --config /path/to/config.ini
 ```
 
-Solution1:
+### Test Mode (Recommended First)
 
-I think these are the relevant issues that are cause by gcc 13 https://gcc.gnu.org/gcc-13/porting_to.html#header-dep-changes
+Set `liveMode=false` in config to simulate order fills without sending real orders. This allows testing the detection logic safely.
+
+### Live Mode
+
+Set `liveMode=true` to send real orders to the exchange. **Use with caution** - ensure:
+1. API key has trading permissions
+2. Account has sufficient balance in the starting asset
+3. `risk` parameter is set appropriately (start small)
+
+## Performance Optimizations
+
+The system is designed for low-latency arbitrage detection:
+
+1. **Two-Stage Screening**: Fast matrix evaluation O(n) filters thousands of paths, then detailed validation only for top-K candidates
+2. **Coalescing Buffer**: During high-frequency updates, only the latest price per symbol is processed
+3. **Pre-computed Coefficients**: Symbol-to-index mapping eliminates string lookups in the hot path
+4. **Lock-free Polling**: Atomic `hasUpdates()` check avoids mutex contention
+5. **Version Counter**: Lightweight staleness detection without locking
+6. **Direct MarketDataStore Access**: Strategy queries prices directly from store, no queue delays
+
+## File Structure
+
 ```
-#include  <cstdint> (for std::int8_t, std::int32_t etc.)  in extension.h / Signals.h / cache.h 
+runner/
+├── include/
+│   ├── common/          # Utilities (Scheduler)
+│   ├── fin/             # Financial types (Order, Symbol, Signal, Filters)
+│   ├── fix/             # FIX protocol (Feeder, Broker, MarketDataStore)
+│   └── strategies/      # Strategy implementations
+├── src/
+│   ├── common/
+│   ├── fin/
+│   ├── fix/
+│   ├── strategies/
+│   └── trader_main.cpp  # Entry point
+├── config/              # Configuration files
+├── cmake/               # CMake modules
+└── CMakeLists.txt
 ```
 
-# Notes :
-Session Authentication
+## Dependencies
 
-Note: Only Ed25519 keys are supported for this feature.
+- **libxchange**: FIX protocol library (local vcpkg port)
+- **Boost**: Property tree (INI parsing)
+- **OpenSSL**: ED25519 cryptography
+- **nlohmann/json**: REST API parsing
 
-If you do not want to specify apiKey and signature in each individual request, you can authenticate your API key for the active WebSocket session.
+## References
 
-Once authenticated, you no longer have to specify apiKey and signature for those requests that need them. Requests will be performed on behalf of the account owning the authenticated API key.
-
-Note: You still have to specify the timestamp parameter for SIGNED requests.
-
-
-
-Timing security
-
-    SIGNED requests also require a timestamp parameter which should be the current millisecond timestamp.
-
-    An additional optional parameter, recvWindow, specifies for how long the request stays valid.
-        If recvWindow is not sent, it defaults to 5000 milliseconds.
-        Maximum recvWindow is 60000 milliseconds.
-
-    Request processing logic is as follows:
-
-    if (timestamp < (serverTime + 1000) && (serverTime - timestamp) <= recvWindow) {
-      // process request
-    } else {
-      // reject request
-    }
-
-Serious trading is about timing. Networks can be unstable and unreliable, which can lead to requests taking varying amounts of time to reach the servers. With recvWindow, you can specify that the request must be processed within a certain number of milliseconds or be rejected by the server.
+- [Binance FIX API Documentation](https://developers.binance.com/docs/binance-spot-api-docs/fix-api)
+- [Binance Spot REST API](https://developers.binance.com/docs/binance-spot-api-docs/rest-api)
+- [Binance Filters](https://developers.binance.com/docs/binance-spot-api-docs/filters)

@@ -90,6 +90,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             data_[data.symbol] = data;
+            globalVersion_.fetch_add(1, std::memory_order_release);
             callbackCopy = callback_;
 
             // Track that we received this snapshot
@@ -141,6 +142,7 @@ public:
             }
 
             data_[update.symbol] = mergedData;
+            globalVersion_.fetch_add(1, std::memory_order_release);
             callbackCopy = callback_;
         }
 
@@ -208,10 +210,22 @@ public:
         return data_.size();
     }
 
+    /**
+     * Get the current version counter.
+     * Incremented on each update (snapshot or incremental).
+     * Used for staleness detection during path evaluation.
+     */
+    uint64_t version() const {
+        return globalVersion_.load(std::memory_order_acquire);
+    }
+
 private:
     mutable std::mutex mutex_;
     std::map<std::string, MarketData> data_;
     UpdateCallback callback_;
+
+    // Version tracking for staleness detection
+    std::atomic<uint64_t> globalVersion_{0};
 
     // Snapshot tracking
     std::set<std::string> expectedSymbols_;

@@ -65,6 +65,16 @@ void TriangularArb::discoverArbitrageRoutes() {
     LOG_INFO("[TriangularArb] Found {} arbitrage paths using {} symbols",
              stratPaths_.size(), stratSymbols_.size());
 
+    // Initialize matrix evaluator for fast path screening
+    std::vector<std::string> allSymbols(stratSymbols_.begin(), stratSymbols_.end());
+    matrixEvaluator_.initialize(
+        stratPaths_,
+        allSymbols,
+        [this](const std::string& s) { return getFeeForSymbol(s); }
+    );
+    LOG_INFO("[TriangularArb] Initialized matrix evaluator with {} paths and {} symbols",
+             matrixEvaluator_.numPaths(), matrixEvaluator_.numSymbols());
+
     // Fetch account balances from REST API
     fetchAccountBalances();
 
@@ -359,6 +369,9 @@ std::vector<std::vector<Order>> TriangularArb::computeArbitragePaths(
 }
 
 std::optional<Signal> TriangularArb::evaluatePath(std::vector<Order>& path) {
+    // Capture version at start for staleness detection
+    uint64_t startVersion = feeder_->getMarketDataStore().version();
+
     Order firstOrder = path[0];
     std::string pathStartingAsset = firstOrder.getStartingAsset();
     std::string pathDescription = std::accumulate(
@@ -502,6 +515,12 @@ std::optional<Signal> TriangularArb::evaluatePath(std::vector<Order>& path) {
         double fee = getFeeForSymbol(symbolStr);
         currentAmount = resultingAmount * (1 - fee / 100);
         LOG_DEBUG("[TriangularArb] Amount after fees ({}%): {}", fee, currentAmount);
+
+        // Check for staleness mid-evaluation
+        if (feeder_->getMarketDataStore().version() != startVersion) {
+            LOG_DEBUG("[TriangularArb] Data changed during evaluation, aborting path");
+            return std::nullopt;  // Will retry with fresh data
+        }
     }
 
     // Calculate PnL: final amount minus initial stake
@@ -535,6 +554,60 @@ std::optional<Signal> TriangularArb::onMarketData(const MarketData& data) {
     }
 
     return outSignal;
+}
+
+std::optional<Signal> TriangularArb::onMarketDataBatch(
+    const std::vector<std::string>& affectedSymbols)
+{
+    // Get initial stake
+    auto balanceIt = balance_.find(startingAsset_);
+    if (balanceIt == balance_.end() || balanceIt->second <= 0) {
+        return std::nullopt;
+    }
+    double initialStake = risk_ * balanceIt->second;
+
+    // Collect affected path indices
+    std::set<size_t> affectedPathIndices;
+    for (const auto& symbol : affectedSymbols) {
+        for (size_t idx : matrixEvaluator_.getPathsForSymbol(symbol)) {
+            affectedPathIndices.insert(idx);
+        }
+    }
+
+    if (affectedPathIndices.empty()) {
+        return std::nullopt;
+    }
+
+    LOG_DEBUG("[TriangularArb] {} paths affected by {} symbol updates",
+              affectedPathIndices.size(), affectedSymbols.size());
+
+    // Update only the affected symbols' prices (selective update)
+    matrixEvaluator_.updatePricesSelective(affectedSymbols, feeder_->getMarketDataStore());
+
+    // Fast matrix evaluation for affected paths only, returns top-K candidates
+    auto candidates = matrixEvaluator_.evaluateAffected(
+        affectedPathIndices, initialStake, TOP_K_CANDIDATES);
+
+    if (candidates.empty()) {
+        return std::nullopt;
+    }
+
+    LOG_DEBUG("[TriangularArb] Found {} potentially profitable paths, validating top {}",
+              candidates.size(), candidates.size());
+
+    // Full validation for top candidates only
+    double maxPnl = 0;
+    std::optional<Signal> bestSignal;
+
+    for (const auto& [approxPnl, pathIdx] : candidates) {
+        auto sig = evaluatePath(stratPaths_[pathIdx]);
+        if (sig.has_value() && sig->pnl > maxPnl) {
+            bestSignal = sig;
+            maxPnl = sig->pnl;
+        }
+    }
+
+    return bestSignal;
 }
 
 void TriangularArb::executeArbitrage(const Signal& signal) {
@@ -592,9 +665,20 @@ void TriangularArb::run() {
 
     while (true) {
         try {
+            // Block until at least one update arrives
             MarketData update = feeder_->getUpdate();
+            coalescingBuffer_.push(update);
 
-            std::optional<Signal> sig = onMarketData(update);
+            // Drain any additional pending updates (non-blocking)
+            while (feeder_->hasUpdate()) {
+                coalescingBuffer_.push(feeder_->getUpdate());
+            }
+
+            // Get all affected symbols and process as batch
+            auto affectedSymbols = coalescingBuffer_.drainAffectedSymbols();
+            LOG_DEBUG("[TriangularArb] Processing batch of {} symbol updates", affectedSymbols.size());
+
+            std::optional<Signal> sig = onMarketDataBatch(affectedSymbols);
 
             if (sig.has_value()) {
                 LOG_INFO("[TriangularArb] Detected trading signal, theo PNL: {}, description: {}",

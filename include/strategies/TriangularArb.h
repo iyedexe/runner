@@ -17,8 +17,10 @@
 // Include fix headers first (they include libxchange logger)
 #include "fix/Feeder.h"
 #include "fix/Broker.h"
+#include "fix/CoalescingBuffer.h"
 
 #include "IStrategy.h"
+#include "strategies/MatrixPathEvaluator.h"
 #include "fin/SymbolFilter.h"
 #include "fin/SymbolFilters.h"
 #include "fin/OrderSizer.h"
@@ -88,7 +90,13 @@ private:
     std::vector<Order> getPossibleOrders(const std::string& coin, const std::vector<::Symbol>& relatedSymbols);
     std::vector<std::vector<Order>> computeArbitragePaths(const std::vector<::Symbol>& symbolsList, const std::string& startingAsset, int arbitrageDepth);
     std::optional<Signal> evaluatePath(std::vector<Order>& path);
+    std::optional<Signal> onMarketDataBatch(const std::vector<std::string>& affectedSymbols);
     void executeArbitrage(const Signal& signal);
 
     ::Symbol createSymbol(const TriArb::SymbolInfo& info);
+
+    // Concurrent market data handling
+    TriArb::CoalescingBuffer coalescingBuffer_;
+    TriArb::MatrixPathEvaluator matrixEvaluator_;
+    static constexpr int TOP_K_CANDIDATES = 5;
 };
