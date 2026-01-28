@@ -15,18 +15,18 @@ enum class OrderType {
 
 class Order {
 private:
-    ::Symbol _symbol;
+    fin::Symbol _symbol;
     Way _way;
     OrderType _type;
     double _quantity;
     double _price;
 
 public:
-    Order(const ::Symbol& symbol, Way way, OrderType type = OrderType::MARKET, double quantity = 0.0, double price = 0.0)
+    Order(const fin::Symbol& symbol, Way way, OrderType type = OrderType::MARKET, double quantity = 0.0, double price = 0.0)
         : _symbol(symbol), _way(way), _type(type), _quantity(quantity), _price(price) {}
 
     Way getWay() const { return _way; }
-    ::Symbol getSymbol() const { return _symbol; }
+    fin::Symbol getSymbol() const { return _symbol; }
 
     double getQty() const { return _quantity; }
     void setQty(double value) { _quantity = value; }

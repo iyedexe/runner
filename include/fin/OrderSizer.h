@@ -62,6 +62,10 @@ public:
      */
     void addSymbol(const std::string& symbol, const SymbolFilters& filters) {
         filters_[symbol] = filters;
+        LOG_DEBUG("[OrderSizer] Added {}: lotStep={}, lotPrec={}, mktStep={}, mktPrec={}",
+                 symbol,
+                 filters.lotSize().stepSize, filters.lotSize().precision,
+                 filters.marketLotSize().stepSize, filters.marketLotSize().precision);
     }
 
     /**
@@ -235,9 +239,16 @@ public:
      * Round quantity to valid step size
      */
     double roundQuantity(const std::string& symbol, double quantity, bool isMarketOrder = false) const {
-        if (!hasSymbol(symbol)) return quantity;
+        if (!hasSymbol(symbol)) {
+            LOG_WARNING("[OrderSizer] Symbol {} not found, returning unrounded qty={:.10f}", symbol, quantity);
+            return quantity;
+        }
         const auto& filters = getFilters(symbol);
-        return isMarketOrder ? filters.roundMarketQty(quantity) : filters.roundQty(quantity);
+        double rounded = isMarketOrder ? filters.roundMarketQty(quantity) : filters.roundQty(quantity);
+        if (rounded != quantity) {
+            LOG_DEBUG("[OrderSizer] {} rounded: {:.10f} -> {:.10f} (mkt={})", symbol, quantity, rounded, isMarketOrder);
+        }
+        return rounded;
     }
 
     /**

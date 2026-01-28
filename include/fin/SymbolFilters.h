@@ -23,8 +23,14 @@ struct PriceFilter {
     bool isValid() const { return tickSize > 0 || minPrice > 0 || maxPrice > 0; }
 
     double roundPrice(double price) const {
-        if (tickSize <= 0) return price;
-        double rounded = std::floor(price / tickSize) * tickSize;
+        double rounded = price;
+        if (tickSize > 0) {
+            rounded = std::floor(price / tickSize) * tickSize;
+        }
+        // Always apply precision truncation (default to 8 decimals if precision not set)
+        int effectivePrecision = (tickSize > 0) ? precision : 8;
+        double mult = std::pow(10.0, effectivePrecision);
+        rounded = std::floor(rounded * mult + 1e-9) / mult;
         if (minPrice > 0) rounded = std::max(minPrice, rounded);
         if (maxPrice > 0) rounded = std::min(maxPrice, rounded);
         return rounded;
@@ -53,8 +59,14 @@ struct LotSizeFilter {
     bool isValid() const { return stepSize > 0 || minQty > 0 || maxQty > 0; }
 
     double roundQty(double qty) const {
-        if (stepSize <= 0) return qty;
-        double rounded = std::floor(qty / stepSize) * stepSize;
+        double rounded = qty;
+        if (stepSize > 0) {
+            rounded = std::floor(qty / stepSize) * stepSize;
+        }
+        // Always apply precision truncation (default to 8 decimals if precision not set)
+        int effectivePrecision = (stepSize > 0) ? precision : 8;
+        double mult = std::pow(10.0, effectivePrecision);
+        rounded = std::floor(rounded * mult + 1e-9) / mult;
         if (minQty > 0) rounded = std::max(minQty, rounded);
         if (maxQty > 0) rounded = std::min(maxQty, rounded);
         return rounded;
@@ -80,8 +92,14 @@ struct MarketLotSizeFilter {
     bool isValid() const { return stepSize > 0 || minQty > 0 || maxQty > 0; }
 
     double roundQty(double qty) const {
-        if (stepSize <= 0) return qty;
-        double rounded = std::floor(qty / stepSize) * stepSize;
+        double rounded = qty;
+        if (stepSize > 0) {
+            rounded = std::floor(qty / stepSize) * stepSize;
+        }
+        // Always apply precision truncation (default to 8 decimals if precision not set)
+        int effectivePrecision = (stepSize > 0) ? precision : 8;
+        double mult = std::pow(10.0, effectivePrecision);
+        rounded = std::floor(rounded * mult + 1e-9) / mult;
         if (minQty > 0) rounded = std::max(minQty, rounded);
         if (maxQty > 0) rounded = std::min(maxQty, rounded);
         return rounded;

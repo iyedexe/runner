@@ -1,4 +1,4 @@
-#include "strategies/TriangularArb.h"
+#include "Runner.h"
 #include <iostream>
 #include <string>
 #include <getopt.h>
@@ -41,9 +41,11 @@ int main(int argc, char* argv[]) {
     }
 
     try {
-        auto config = TriangularArb::loadConfig(configFile);
-        TriangularArb strategy(config);
-        strategy.run();
+        auto config = Runner::loadConfig(configFile);
+        Runner runner(config);
+        runner.initialize();
+        runner.run();
+        runner.shutdown();
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
         return 1;

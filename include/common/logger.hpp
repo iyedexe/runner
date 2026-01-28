@@ -19,7 +19,7 @@ namespace {
                 quill::PatternFormatterOptions {"[%(time)] [PID=%(process_id)] [TID=%(thread_id)] [LOG_%(log_level:<4)] %(message)", "%Y-%m-%d %H:%M:%S.%Qns", quill::Timezone::GmtTime }
             );
         }();
-        // logger->set_log_level(quill::LogLevel::Debug);
+        logger->set_log_level(quill::LogLevel::Debug);
         return logger;
     }
 }

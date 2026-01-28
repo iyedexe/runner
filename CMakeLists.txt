@@ -23,10 +23,13 @@ set(COMMON_SOURCES
 set(TRADER_SOURCES
     ${COMMON_SOURCES}
     src/fin/SymbolFilters.cpp
-    src/strategies/TriangularArb.cpp
+    src/strategies/ArbitragePath.cpp
+    src/strategies/TriangularArbitrage.cpp
     src/strategies/IStrategy.cpp
-    src/fix/Feeder.cpp
-    src/fix/Broker.cpp
+    src/market_connection/Admin.cpp
+    src/market_connection/Feeder.cpp
+    src/market_connection/Broker.cpp
+    src/Runner.cpp
     src/trader_main.cpp
 )
 

@@ -1,11 +1,9 @@
-#include "fix/Broker.h"
+#include "market_connection/Broker.h"
 #include "fix/messages/NewSingleOrder.hpp"
 #include "fix/parsers/ExecutionReportParser.hpp"
 #include "codegen/fix/OE/FixValues.h"
-#include "common/logger.hpp"
+#include "logger.hpp"
 #include <chrono>
-
-namespace TriArb {
 
 Broker::Broker(const std::string& apiKey, crypto::ed25519& key, bool liveMode)
     : BNB::FIX::Broker(apiKey, key)
@@ -13,15 +11,15 @@ Broker::Broker(const std::string& apiKey, crypto::ed25519& key, bool liveMode)
 {
 }
 
-std::string Broker::sendMarketOrder(const std::string& symbol, char side, double qty) {
+std::string Broker::sendMarketOrder(const std::string& symbol, char side, double qty, double estPrice) {
     std::string clOrdId = generateClOrdId();
 
-    LOG_INFO("[Broker] Sending market order: clOrdId={}, symbol={}, side={}, qty={}",
+    LOG_INFO("[Broker] Sending market order: clOrdId={}, symbol={}, side={}, qty={:.8f}",
              clOrdId, symbol, side, qty);
 
     if (!liveMode_) {
         LOG_WARNING("[Broker] Test mode - order not sent to exchange");
-        return testMarketOrder(symbol, side, qty);
+        return testMarketOrder(symbol, side, qty, estPrice);
     }
 
     // Create order state before sending
@@ -44,13 +42,13 @@ std::string Broker::sendMarketOrder(const std::string& symbol, char side, double
     return clOrdId;
 }
 
-std::string Broker::testMarketOrder(const std::string& symbol, char side, double qty) {
+std::string Broker::testMarketOrder(const std::string& symbol, char side, double qty, double estPrice) {
     std::string clOrdId = generateClOrdId();
 
-    LOG_INFO("[Broker] Test market order: clOrdId={}, symbol={}, side={}, qty={}",
-             clOrdId, symbol, side, qty);
+    LOG_INFO("[Broker] Test market order: clOrdId={}, symbol={}, side={}, qty={}, estPrice={}",
+             clOrdId, symbol, side, qty, estPrice);
 
-    // Simulate immediate fill in test mode
+    // Simulate immediate fill in test mode using estimated price
     {
         std::lock_guard<std::mutex> lock(orderMtx_);
         OrderState state;
@@ -59,6 +57,7 @@ std::string Broker::testMarketOrder(const std::string& symbol, char side, double
         state.side = side;
         state.orderQty = qty;
         state.cumQty = qty;
+        state.avgPx = estPrice;  // Use estimated price for test mode
         state.status = OrderStatus::FILLED;
         orderStates_[clOrdId] = state;
     }
@@ -103,8 +102,9 @@ void Broker::onMessage(const FIX44::OE::ExecutionReport& message, const FIX::Ses
     // Use libxchange parser to extract fields
     auto exec = BNB::FIX::ExecutionReportParser::parse(message);
 
-    LOG_INFO("[Broker] ExecutionReport: clOrdId={}, symbol={}, execType={}, ordStatus={}, cumQty={}",
-             exec.clOrdId, exec.symbol, static_cast<int>(exec.execType), static_cast<int>(exec.status), exec.cumQty);
+    LOG_INFO("[Broker] ExecutionReport: clOrdId={}, symbol={}, execType={}, ordStatus={}, cumQty={}, lastPx={}, lastQty={}",
+             exec.clOrdId, exec.symbol, static_cast<int>(exec.execType), static_cast<int>(exec.status),
+             exec.cumQty, exec.lastPx, exec.lastQty);
 
     {
         std::lock_guard<std::mutex> lock(orderMtx_);
@@ -124,6 +124,16 @@ void Broker::onMessage(const FIX44::OE::ExecutionReport& message, const FIX::Ses
         it->second.cumQty = exec.cumQty;
         it->second.status = exec.status;
         it->second.rejectReason = exec.text;
+
+        // Calculate avgPx from fills (for TRADE exec type)
+        if (exec.execType == BNB::FIX::ExecType::TRADE && exec.lastQty > 0) {
+            it->second.cumCost += exec.lastPx * exec.lastQty;
+            if (it->second.cumQty > 0) {
+                it->second.avgPx = it->second.cumCost / it->second.cumQty;
+            }
+            LOG_INFO("[Broker] Fill: lastPx={:.8f}, lastQty={:.8f}, avgPx={:.8f}",
+                     exec.lastPx, exec.lastQty, it->second.avgPx);
+        }
     }
     orderCv_.notify_all();
 }
@@ -148,5 +158,3 @@ std::string Broker::generateClOrdId() {
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
     return "TA" + std::to_string(ms) + "_" + std::to_string(++orderIdCounter_);
 }
-
-} // namespace TriArb

@@ -4,7 +4,6 @@
 #include <string>
 #include <nlohmann/json.hpp>
 #include "fin/Symbol.h"
-#include "fin/SymbolFilter.h"
 
 class ExchangeInfo {
 public:
@@ -14,7 +13,7 @@ public:
         }
     }
 
-    std::vector<Symbol> getSymbols() const {
+    std::vector<fin::Symbol> getSymbols() const {
         return symbols_;
     }
 
@@ -25,14 +24,14 @@ private:
             std::string baseAsset = sym["baseAsset"].get<std::string>();
             std::string quoteAsset = sym["quoteAsset"].get<std::string>();
 
-            SymbolFilter filter;
+            SymbolFilters filters;
             if (sym.contains("filters")) {
-                filter = SymbolFilter::fromJson(sym["filters"]);
+                filters = SymbolFilters::fromJson(sym["filters"]);
             }
 
-            symbols_.emplace_back(baseAsset, quoteAsset, symbol, filter);
+            symbols_.emplace_back(baseAsset, quoteAsset, symbol, filters);
         }
     }
 
-    std::vector<Symbol> symbols_;
+    std::vector<fin::Symbol> symbols_;
 };
