@@ -23,9 +23,8 @@ set(COMMON_SOURCES
 set(TRADER_SOURCES
     ${COMMON_SOURCES}
     src/fin/SymbolFilters.cpp
-    src/strategies/ArbitragePath.cpp
-    src/strategies/TriangularArbitrage.cpp
-    src/strategies/IStrategy.cpp
+    src/strategies/circular_arbitrage/ArbitragePath.cpp
+    src/strategies/circular_arbitrage/TriangularArbitrage.cpp
     src/market_connection/Admin.cpp
     src/market_connection/Feeder.cpp
     src/market_connection/Broker.cpp
@@ -49,5 +48,17 @@ set(COMMON_LIBS
 
 # Trader executable
 add_executable(trader ${TRADER_SOURCES})
-target_include_directories(trader PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(trader PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/common
+)
 target_link_libraries(trader PRIVATE ${COMMON_LIBS})
+
+# Enable architecture-specific optimizations
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(trader PRIVATE
+        -march=native
+        -O3
+        -funroll-loops
+    )
+endif()

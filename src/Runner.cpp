@@ -13,7 +13,7 @@ Runner::Runner(const RunnerConfig& config)
     admin_ = std::make_unique<Admin>(config.restEndpoint, config.apiKey, *key_);
 
     LOG_INFO("[Runner] Creating Feeder (FIX market data)");
-    feeder_ = std::make_unique<Feeder>(config.apiKey, *key_);
+    feeder_ = std::make_unique<Feeder>(config.apiKey, *key_, orderBook_);
 
     LOG_INFO("[Runner] Creating Broker (FIX order execution, liveMode={})", config.liveMode);
     broker_ = std::make_unique<Broker>(config.apiKey, *key_, config.liveMode);
@@ -54,21 +54,24 @@ void Runner::initialize() {
 
     LOG_INFO("[Runner] FIX sessions connected");
 
-    if (!symbolsList_.empty()) {
-        std::vector<std::string> symbolsAsStrings;
-        symbolsAsStrings.reserve(symbolsList_.size());
-        for (const auto& s : symbolsList_) {
-            symbolsAsStrings.push_back(s.to_str());
-        }
-        
-        LOG_INFO("[Runner] Subscribing to market data for {} symbols", symbolsAsStrings.size());
-        feeder_->subscribeToSymbols(symbolsAsStrings);
+    // Subscribe only to symbols that are part of arbitrage paths
+    const auto& strategySymbols = strategy_->subscribedSymbols();
+    if (!strategySymbols.empty()) {
+        std::vector<std::string> symbolsToSubscribe(strategySymbols.begin(), strategySymbols.end());
 
-        // Wait for all market data snapshots to arrive before starting
+        LOG_INFO("[Runner] Subscribing to market data for {} symbols (out of {} total)",
+                 symbolsToSubscribe.size(), symbolsList_.size());
+        feeder_->subscribeToSymbols(symbolsToSubscribe);
+
         waitForMarketDataSnapshots();
+    } else {
+        LOG_WARNING("[Runner] No arbitrage paths found, no symbols to subscribe to");
     }
 
     LOG_INFO("[Runner] Initialization complete");
+    LOG_INFO("[Runner] Polling mode: {}",
+             config_.pollingMode == PollingMode::Blocking ? "Blocking" :
+             config_.pollingMode == PollingMode::BusyPoll ? "BusyPoll" : "Hybrid");
 }
 
 void Runner::shutdown() {
@@ -85,7 +88,6 @@ void Runner::shutdown() {
 void Runner::waitForMarketDataSnapshots() {
     LOG_INFO("[Runner] Waiting for market data snapshots...");
 
-    // Wait up to 30 seconds for all snapshots
     bool success = feeder_->waitForAllSnapshots(30000);
 
     auto [received, expected] = feeder_->getSnapshotProgress();
@@ -94,6 +96,11 @@ void Runner::waitForMarketDataSnapshots() {
     } else {
         LOG_WARNING("[Runner] Timeout waiting for snapshots, received {}/{}", received, expected);
     }
+}
+
+void Runner::handleExecutionFailure(int legIndex, const std::string& clOrdId, const std::string& reason) {
+    balance_ = admin_->fetchAccountBalances();
+    throw ArbitrageExecutionError(reason, legIndex, clOrdId);
 }
 
 void Runner::executeArbitrage(const Signal& signal) {
@@ -105,22 +112,11 @@ void Runner::executeArbitrage(const Signal& signal) {
     LOG_INFO("[Runner] Theoretical PnL: {:.8f}", signal.pnl);
     LOG_INFO("[Runner] {} Balance: {:.8f}", startingAsset, balance_[startingAsset]);
 
-    // Track execution results for PnL calculation
-    struct LegResult {
-        std::string symbol;
-        Way way;
-        double estPrice;
-        double realPrice;
-        double estQty;
-        double realQty;
-        double feeRate;
-    };
     std::vector<LegResult> results;
     results.reserve(signal.orders.size());
 
     size_t legIndex = 0;
 
-    // Orders are already validated by evaluate() - just execute them sequentially
     for (const auto& order : signal.orders) {
         char side = (order.getWay() == Way::BUY) ? FIX::OE::Side_BUY : FIX::OE::Side_SELL;
         std::string symbol = order.getSymbol().to_str();
@@ -131,57 +127,44 @@ void Runner::executeArbitrage(const Signal& signal) {
         LOG_INFO("[Runner] Leg {}: {} {} @ MARKET, estPrice={:.8f}, qty={:.8f}",
                  legIndex + 1, (side == FIX::OE::Side_BUY ? "BUY" : "SELL"), symbol, estPrice, qty);
 
-        std::string clOrdId;
-        clOrdId = broker_->sendMarketOrder(symbol, side, qty, estPrice);
+        std::string clOrdId = broker_->sendMarketOrder(symbol, side, qty, estPrice);
 
-        // Wait for order completion
         auto status = broker_->waitForOrderCompletion(clOrdId, 5000);
 
-        // Check for rejection or timeout
         if (status == OrderStatus::REJECTED) {
             auto orderState = broker_->getOrderState(clOrdId);
             LOG_CRITICAL("[Runner] Leg {}: Order {} REJECTED: {}",
                         legIndex + 1, clOrdId, orderState.rejectReason);
-            balance_ = admin_->fetchAccountBalances();  // Sync balances
-            throw ArbitrageExecutionError(
-                "Order rejected at leg " + std::to_string(legIndex + 1) + ": " + orderState.rejectReason,
-                static_cast<int>(legIndex), clOrdId);
+            handleExecutionFailure(static_cast<int>(legIndex), clOrdId,
+                "Order rejected at leg " + std::to_string(legIndex + 1) + ": " + orderState.rejectReason);
         }
 
         if (status == OrderStatus::UNKNOWN) {
             LOG_CRITICAL("[Runner] Leg {}: Order {} TIMEOUT - status unknown",
                         legIndex + 1, clOrdId);
-            balance_ = admin_->fetchAccountBalances();  // Sync balances
-            throw ArbitrageExecutionError(
-                "Order timeout at leg " + std::to_string(legIndex + 1) + " - manual intervention required",
-                static_cast<int>(legIndex), clOrdId);
+            handleExecutionFailure(static_cast<int>(legIndex), clOrdId,
+                "Order timeout at leg " + std::to_string(legIndex + 1) + " - manual intervention required");
         }
 
         if (status != OrderStatus::FILLED) {
             LOG_CRITICAL("[Runner] Leg {}: Order {} unexpected status={}",
                         legIndex + 1, clOrdId, static_cast<int>(status));
-            balance_ = admin_->fetchAccountBalances();  // Sync balances
-            throw ArbitrageExecutionError(
-                "Order failed at leg " + std::to_string(legIndex + 1) + " with status " + std::to_string(static_cast<int>(status)),
-                static_cast<int>(legIndex), clOrdId);
+            handleExecutionFailure(static_cast<int>(legIndex), clOrdId,
+                "Order failed at leg " + std::to_string(legIndex + 1) + " with status " + std::to_string(static_cast<int>(status)));
         }
 
         auto orderState = broker_->getOrderState(clOrdId);
         double realPrice = orderState.avgPx;
         double realQty = orderState.cumQty;
 
-        // Check for partial fill (should not happen with FILLED status, but be safe)
-        if (realQty < qty * 0.99) {  // Allow 1% tolerance for rounding
+        if (realQty < qty * 0.99) {
             LOG_CRITICAL("[Runner] Leg {}: Order {} PARTIAL FILL: requested={:.8f}, filled={:.8f}",
                         legIndex + 1, clOrdId, qty, realQty);
-            balance_ = admin_->fetchAccountBalances();  // Sync balances
-            throw ArbitrageExecutionError(
+            handleExecutionFailure(static_cast<int>(legIndex), clOrdId,
                 "Partial fill at leg " + std::to_string(legIndex + 1) + ": requested " +
-                std::to_string(qty) + ", filled " + std::to_string(realQty),
-                static_cast<int>(legIndex), clOrdId);
+                std::to_string(qty) + ", filled " + std::to_string(realQty));
         }
 
-        // Calculate slippage (guard against division by zero)
         double slippage = (estPrice > 0) ? ((realPrice - estPrice) / estPrice * 100.0) : 0.0;
 
         LOG_INFO("[Runner] Leg {}: FILLED clOrdId={}", legIndex + 1, clOrdId);
@@ -194,31 +177,24 @@ void Runner::executeArbitrage(const Signal& signal) {
         ++legIndex;
     }
 
-    // All legs executed successfully - calculate and report PnL
+    // Calculate and report PnL
     {
         double balanceBefore = balance_[startingAsset];
 
-        // Refresh balances from exchange
         balance_ = admin_->fetchAccountBalances();
         double balanceAfter = balance_[startingAsset];
         double actualPnl = balanceAfter - balanceBefore;
 
-        // Trace through actual execution to calculate expected final amount
-        // Use REAL executed quantities and prices
         double traceAmount = results[0].realQty;
         if (results[0].way == Way::BUY) {
-            // First leg was BUY: we spent quote to get base
-            // Input was quote = realQty * realPrice
             traceAmount = results[0].realQty * results[0].realPrice;
         }
         double initialStake = traceAmount;
 
         for (const auto& r : results) {
             if (r.way == Way::BUY) {
-                // BUY BASE/QUOTE: input quote, output base = (quote / price) * (1 - fee)
                 traceAmount = (traceAmount / r.realPrice) * (1.0 - r.feeRate);
             } else {
-                // SELL BASE/QUOTE: input base, output quote = (base * price) * (1 - fee)
                 traceAmount = (traceAmount * r.realPrice) * (1.0 - r.feeRate);
             }
         }
@@ -245,17 +221,33 @@ void Runner::run() {
 
     while (true) {
         try {
-            auto updatedBooks = feeder_->waitForBookUpdate();
+            // Wait for market data updates based on polling mode
+            std::bitset<MAX_SYMBOLS> updatedSymbols;
+
+            switch (config_.pollingMode) {
+                case PollingMode::Blocking:
+                    updatedSymbols = orderBook_.waitForUpdates();
+                    break;
+                case PollingMode::BusyPoll:
+                    updatedSymbols = orderBook_.waitForUpdatesSpin(INT_MAX);
+                    break;
+                case PollingMode::Hybrid:
+                default:
+                    updatedSymbols = orderBook_.waitForUpdatesSpin(config_.busyPollSpinCount);
+                    break;
+            }
 
             auto balanceIt = balance_.find(startingAsset);
-            if (balanceIt == balance_.end() || balanceIt->second <= 0) {
+            if (balanceIt == balance_.end() || balanceIt->second <= 0) [[unlikely]] {
+                LOG_CRITICAL("[Runner] No balance for starting asset '{}' - exiting", startingAsset);
                 return;
             }
             const double stake = risk * balanceIt->second;
 
-            std::optional<Signal> sig = strategy_->onMarketDataBatch(updatedBooks, stake, orderSizer_);
+            std::optional<Signal> sig = strategy_->onMarketDataUpdate(
+                updatedSymbols, orderBook_, stake, orderSizer_);
 
-            if (sig.has_value()) {
+            if (sig.has_value()) [[unlikely]] {
                 executeArbitrage(*sig);
             }
         } catch (const std::exception& e) {
@@ -276,6 +268,7 @@ RunnerConfig Runner::loadConfig(const std::string& configFile) {
         config.strategyConfig.startingAsset = pt.get<std::string>("TRIANGULAR_ARB_STRATEGY.startingAsset");
         config.strategyConfig.defaultFee = pt.get<double>("TRIANGULAR_ARB_STRATEGY.defaultFee", 0.1);
         config.strategyConfig.risk = pt.get<double>("TRIANGULAR_ARB_STRATEGY.risk", 1.0);
+        config.strategyConfig.minProfitRatio = pt.get<double>("TRIANGULAR_ARB_STRATEGY.minProfitRatio", 1.0001);
 
         // Runner config
         config.liveMode = pt.get<bool>("TRIANGULAR_ARB_STRATEGY.liveMode", false);
@@ -287,7 +280,18 @@ RunnerConfig Runner::loadConfig(const std::string& configFile) {
         config.apiKey = pt.get<std::string>("FIX_CONNECTION.apiKey");
         config.ed25519KeyPath = pt.get<std::string>("FIX_CONNECTION.ed25519KeyPath");
 
-        // Parse per-symbol fees from [SYMBOL_FEES] section
+        // Polling mode
+        std::string pollingModeStr = pt.get<std::string>("PERFORMANCE.pollingMode", "hybrid");
+        if (pollingModeStr == "blocking") {
+            config.pollingMode = PollingMode::Blocking;
+        } else if (pollingModeStr == "busy_poll") {
+            config.pollingMode = PollingMode::BusyPoll;
+        } else {
+            config.pollingMode = PollingMode::Hybrid;
+        }
+        config.busyPollSpinCount = pt.get<int>("PERFORMANCE.busyPollSpinCount", 10000);
+
+        // Per-symbol fees
         auto symbolFeesSection = pt.get_child_optional("SYMBOL_FEES");
         if (symbolFeesSection) {
             for (const auto& item : *symbolFeesSection) {
