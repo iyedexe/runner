@@ -20,6 +20,9 @@ Runner::Runner(const RunnerConfig& config)
 
     LOG_INFO("[Runner] Creating TriangularArbitrage strategy");
     strategy_ = std::make_unique<TriangularArbitrage>(config.strategyConfig);
+
+    LOG_INFO("[Runner] Creating TradePersistence in: {}", config.tradeLogDir);
+    tradePersistence_ = std::make_unique<TradePersistence>(config.tradeLogDir);
 }
 
 void Runner::initialize() {
@@ -98,9 +101,112 @@ void Runner::waitForMarketDataSnapshots() {
     }
 }
 
-void Runner::handleExecutionFailure(int legIndex, const std::string& clOrdId, const std::string& reason) {
+void Runner::handleExecutionFailure(int legIndex, const std::string& clOrdId, const std::string& reason,
+                                    const std::vector<ExecutedOrder>& executedOrders) {
+    LOG_CRITICAL("[Runner] ========== EXECUTION FAILURE ==========");
+    LOG_CRITICAL("[Runner] Failed at leg {}: {}", legIndex + 1, reason);
+
+    // Execute rollback for previously successful orders
+    if (!executedOrders.empty()) {
+        LOG_WARNING("[Runner] Initiating rollback for {} executed order(s)", executedOrders.size());
+        bool rollbackSuccess = executeRollback(executedOrders);
+        if (rollbackSuccess) {
+            LOG_INFO("[Runner] Rollback completed successfully");
+        } else {
+            LOG_CRITICAL("[Runner] ROLLBACK PARTIALLY FAILED - manual intervention required");
+        }
+    } else {
+        LOG_INFO("[Runner] No orders to rollback (failed on first leg)");
+    }
+
+    // Refresh balance after rollback attempts
     balance_ = admin_->fetchAccountBalances();
+
+    LOG_CRITICAL("[Runner] ==========================================");
     throw ArbitrageExecutionError(reason, legIndex, clOrdId);
+}
+
+bool Runner::executeRollback(const std::vector<ExecutedOrder>& executedOrders) {
+    LOG_WARNING("[Runner] ========== EXECUTING ROLLBACK ==========");
+
+    bool allRollbacksSucceeded = true;
+    constexpr int ROLLBACK_TIMEOUT_MS = 10000;  // Longer timeout for rollback orders
+    constexpr int MAX_ROLLBACK_RETRIES = 1;     // Only retry once to avoid infinite loops
+
+    // Process rollbacks in reverse order (LIFO) to properly unwind the position
+    for (auto it = executedOrders.rbegin(); it != executedOrders.rend(); ++it) {
+        const auto& executed = *it;
+
+        // Determine opposite side: BUY ('1') -> SELL ('2'), SELL ('2') -> BUY ('1')
+        char rollbackSide = (executed.side == FIX::OE::Side_BUY) ? FIX::OE::Side_SELL : FIX::OE::Side_BUY;
+        const char* sideStr = (rollbackSide == FIX::OE::Side_BUY) ? "BUY" : "SELL";
+        const char* origSideStr = (executed.side == FIX::OE::Side_BUY) ? "BUY" : "SELL";
+
+        LOG_WARNING("[Runner] Rollback: {} {} qty={:.8f} (original was {} @ {:.8f})",
+                    sideStr, executed.symbol, executed.filledQty,
+                    origSideStr, executed.avgPrice);
+
+        bool rollbackSucceeded = false;
+        int retryCount = 0;
+
+        while (!rollbackSucceeded && retryCount <= MAX_ROLLBACK_RETRIES) {
+            if (retryCount > 0) {
+                LOG_WARNING("[Runner] Rollback retry {} for {}", retryCount, executed.symbol);
+            }
+
+            // Use the original fill price as estimate for the rollback
+            std::string rollbackClOrdId = broker_->sendMarketOrder(
+                executed.symbol,
+                rollbackSide,
+                executed.filledQty,
+                executed.avgPrice
+            );
+
+            auto status = broker_->waitForOrderCompletion(rollbackClOrdId, ROLLBACK_TIMEOUT_MS);
+
+            if (status == OrderStatus::FILLED) {
+                auto rollbackState = broker_->getOrderState(rollbackClOrdId);
+
+                // Check for partial fills - warn but consider it a success if mostly filled
+                double fillRatio = rollbackState.cumQty / executed.filledQty;
+                if (fillRatio < 0.99) {
+                    LOG_WARNING("[Runner] Rollback PARTIAL: clOrdId={}, requested={:.8f}, filled={:.8f} ({:.1f}%)",
+                                rollbackClOrdId, executed.filledQty, rollbackState.cumQty, fillRatio * 100.0);
+                } else {
+                    LOG_INFO("[Runner] Rollback FILLED: clOrdId={}, qty={:.8f}, avgPx={:.8f}",
+                             rollbackClOrdId, rollbackState.cumQty, rollbackState.avgPx);
+                }
+                rollbackSucceeded = true;
+
+            } else if (status == OrderStatus::REJECTED) {
+                auto rollbackState = broker_->getOrderState(rollbackClOrdId);
+                LOG_ERROR("[Runner] Rollback REJECTED: clOrdId={}, reason={}",
+                          rollbackClOrdId, rollbackState.rejectReason);
+
+            } else if (status == OrderStatus::UNKNOWN) {
+                LOG_ERROR("[Runner] Rollback TIMEOUT: clOrdId={} - status unknown after {}ms",
+                          rollbackClOrdId, ROLLBACK_TIMEOUT_MS);
+
+            } else {
+                LOG_ERROR("[Runner] Rollback FAILED: clOrdId={}, status={}",
+                          rollbackClOrdId, static_cast<int>(status));
+            }
+
+            ++retryCount;
+        }
+
+        if (!rollbackSucceeded) {
+            LOG_CRITICAL("[Runner] ROLLBACK FAILED for {}: {} {} qty={:.8f}",
+                         executed.clOrdId, sideStr, executed.symbol, executed.filledQty);
+            allRollbacksSucceeded = false;
+            // Continue attempting other rollbacks - don't abort early
+        }
+    }
+
+    LOG_WARNING("[Runner] ========== ROLLBACK {} ==========",
+                allRollbacksSucceeded ? "COMPLETE" : "INCOMPLETE");
+
+    return allRollbacksSucceeded;
 }
 
 void Runner::executeArbitrage(const Signal& signal) {
@@ -112,8 +218,16 @@ void Runner::executeArbitrage(const Signal& signal) {
     LOG_INFO("[Runner] Theoretical PnL: {:.8f}", signal.pnl);
     LOG_INFO("[Runner] {} Balance: {:.8f}", startingAsset, balance_[startingAsset]);
 
+    // Start persistence sequence for this arbitrage
+    std::string parentTradeId = tradePersistence_->startArbitrageSequence();
+    const size_t totalLegs = signal.orders.size();
+
     std::vector<LegResult> results;
     results.reserve(signal.orders.size());
+
+    // Track executed orders for potential rollback
+    std::vector<ExecutedOrder> executedOrders;
+    executedOrders.reserve(signal.orders.size());
 
     size_t legIndex = 0;
 
@@ -136,21 +250,24 @@ void Runner::executeArbitrage(const Signal& signal) {
             LOG_CRITICAL("[Runner] Leg {}: Order {} REJECTED: {}",
                         legIndex + 1, clOrdId, orderState.rejectReason);
             handleExecutionFailure(static_cast<int>(legIndex), clOrdId,
-                "Order rejected at leg " + std::to_string(legIndex + 1) + ": " + orderState.rejectReason);
+                "Order rejected at leg " + std::to_string(legIndex + 1) + ": " + orderState.rejectReason,
+                executedOrders);
         }
 
         if (status == OrderStatus::UNKNOWN) {
             LOG_CRITICAL("[Runner] Leg {}: Order {} TIMEOUT - status unknown",
                         legIndex + 1, clOrdId);
             handleExecutionFailure(static_cast<int>(legIndex), clOrdId,
-                "Order timeout at leg " + std::to_string(legIndex + 1) + " - manual intervention required");
+                "Order timeout at leg " + std::to_string(legIndex + 1) + " - manual intervention required",
+                executedOrders);
         }
 
         if (status != OrderStatus::FILLED) {
             LOG_CRITICAL("[Runner] Leg {}: Order {} unexpected status={}",
                         legIndex + 1, clOrdId, static_cast<int>(status));
             handleExecutionFailure(static_cast<int>(legIndex), clOrdId,
-                "Order failed at leg " + std::to_string(legIndex + 1) + " with status " + std::to_string(static_cast<int>(status)));
+                "Order failed at leg " + std::to_string(legIndex + 1) + " with status " + std::to_string(static_cast<int>(status)),
+                executedOrders);
         }
 
         auto orderState = broker_->getOrderState(clOrdId);
@@ -160,9 +277,20 @@ void Runner::executeArbitrage(const Signal& signal) {
         if (realQty < qty * 0.99) {
             LOG_CRITICAL("[Runner] Leg {}: Order {} PARTIAL FILL: requested={:.8f}, filled={:.8f}",
                         legIndex + 1, clOrdId, qty, realQty);
+            // For partial fills, still track what was executed for rollback
+            if (realQty > 0) {
+                executedOrders.push_back({
+                    .clOrdId = clOrdId,
+                    .symbol = symbol,
+                    .side = side,
+                    .filledQty = realQty,
+                    .avgPrice = realPrice
+                });
+            }
             handleExecutionFailure(static_cast<int>(legIndex), clOrdId,
                 "Partial fill at leg " + std::to_string(legIndex + 1) + ": requested " +
-                std::to_string(qty) + ", filled " + std::to_string(realQty));
+                std::to_string(qty) + ", filled " + std::to_string(realQty),
+                executedOrders);
         }
 
         double slippage = (estPrice > 0) ? ((realPrice - estPrice) / estPrice * 100.0) : 0.0;
@@ -172,6 +300,36 @@ void Runner::executeArbitrage(const Signal& signal) {
                  estPrice, realPrice, slippage);
         LOG_INFO("[Runner]   Est  Qty:   {:.8f} | Real Qty:   {:.8f}",
                  qty, realQty);
+
+        // Track successful execution for potential rollback
+        executedOrders.push_back({
+            .clOrdId = clOrdId,
+            .symbol = symbol,
+            .side = side,
+            .filledQty = realQty,
+            .avgPrice = realPrice
+        });
+
+        // Determine trade type based on leg position
+        TradeType tradeType = (legIndex == 0) ? TradeType::ENTRY :
+                              (legIndex == totalLegs - 1) ? TradeType::EXIT :
+                              TradeType::INTERMEDIATE;
+
+        // Record trade (PnL will be updated for EXIT trade after calculation)
+        tradePersistence_->recordTrade(
+            clOrdId,
+            parentTradeId,
+            tradeType,
+            symbol,
+            (side == FIX::OE::Side_BUY) ? "BUY" : "SELL",
+            estPrice,
+            qty,
+            realPrice,
+            realQty,
+            TradeStatus::EXECUTED,
+            0.0,  // PnL (updated later for EXIT)
+            0.0   // PnL% (updated later for EXIT)
+        );
 
         results.push_back({symbol, order.getWay(), estPrice, realPrice, qty, realQty, feeRate});
         ++legIndex;
@@ -219,14 +377,18 @@ void Runner::run() {
     const auto& startingAsset = strategy_->startingAsset();
     const double risk = strategy_->risk();
 
-    while (true) {
+    while (!shutdownRequested_.load(std::memory_order_acquire)) {
         try {
             // Wait for market data updates based on polling mode
             std::bitset<MAX_SYMBOLS> updatedSymbols;
 
             switch (config_.pollingMode) {
                 case PollingMode::Blocking:
-                    updatedSymbols = orderBook_.waitForUpdates();
+                    // Use timed wait for periodic shutdown checks
+                    updatedSymbols = orderBook_.waitForUpdatesWithTimeout(std::chrono::milliseconds(100));
+                    if (updatedSymbols.none()) {
+                        continue;  // Timeout - check shutdown flag and retry
+                    }
                     break;
                 case PollingMode::BusyPoll:
                     updatedSymbols = orderBook_.waitForUpdatesSpin(INT_MAX);
@@ -255,6 +417,8 @@ void Runner::run() {
             break;
         }
     }
+
+    LOG_INFO("[Runner] Shutdown requested, exiting main loop");
 }
 
 RunnerConfig Runner::loadConfig(const std::string& configFile) {
@@ -290,6 +454,9 @@ RunnerConfig Runner::loadConfig(const std::string& configFile) {
             config.pollingMode = PollingMode::Hybrid;
         }
         config.busyPollSpinCount = pt.get<int>("PERFORMANCE.busyPollSpinCount", 10000);
+
+        // Persistence config
+        config.tradeLogDir = pt.get<std::string>("PERSISTENCE.tradeLogDir", "./trades");
 
         // Per-symbol fees
         auto symbolFeesSection = pt.get_child_optional("SYMBOL_FEES");

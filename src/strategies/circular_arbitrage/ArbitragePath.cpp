@@ -93,15 +93,15 @@ std::optional<Signal> ArbitragePath::evaluate(
     const OrderSizer& orderSizer,
     const FeeFunction& getFee) const
 {
-    std::vector<Order> workingOrders = orders_;
+    // Use mutable working buffers instead of copying orders_ vector
     double currentAmount = initialStake;
 
     // Fee rate as decimal (e.g., 0.001 for 0.1%)
     const double feeRate = 1.0 - feeMultipliers_[0];
 
     for (size_t leg = 0; leg < 3; ++leg) {
-        auto& order = workingOrders[leg];
-        const std::string& symbol = symbolStrings_[leg];
+        const auto& order = orders_[leg];
+        const SymbolId symId = symbolIds_[leg];
 
         // Use cached prices
         double bid = bids_[leg];
@@ -111,34 +111,31 @@ std::optional<Signal> ArbitragePath::evaluate(
             return std::nullopt;
         }
 
-        const bool isBuy = isBuy_[leg];
-        double orderPrice = isBuy ? ask : bid;
+        double orderPrice = isBuy_[leg] ? ask : bid;
+        workingPrices_[leg] = orderPrice;
 
-        if (isBuy) {
+        if (isBuy_[leg]) {
             // BUY: give quote, get base
             // get = startingQty / ask, then apply fee to what we get
             double rawGetQty = currentAmount / orderPrice;
             double endingQty = rawGetQty * (1.0 - feeRate);
 
-            // Round ending qty to lot size for validation
-            double roundedEndingQty = orderSizer.hasSymbol(symbol)
-                ? orderSizer.roundQuantity(symbol, endingQty, true)
+            // Round ending qty to lot size for validation (using O(1) SymbolId lookup)
+            double roundedEndingQty = orderSizer.hasSymbol(symId)
+                ? orderSizer.roundQuantity(symId, endingQty, true)
                 : order.getSymbol().getFilters().roundQty(endingQty);
 
             if (roundedEndingQty <= 0) [[unlikely]] {
                 return std::nullopt;
             }
 
-            order.setPrice(orderPrice);
-            order.setQty(rawGetQty);
-            order.setType(OrderType::MARKET);
-
+            workingQtys_[leg] = rawGetQty;
             currentAmount = endingQty;
         } else {
             // SELL: give base, get quote
-            // Round the qty we're selling to lot size
-            double roundedSellQty = orderSizer.hasSymbol(symbol)
-                ? orderSizer.roundQuantity(symbol, currentAmount, true)
+            // Round the qty we're selling to lot size (using O(1) SymbolId lookup)
+            double roundedSellQty = orderSizer.hasSymbol(symId)
+                ? orderSizer.roundQuantity(symId, currentAmount, true)
                 : order.getSymbol().getFilters().roundQty(currentAmount);
 
             if (roundedSellQty <= 0) [[unlikely]] {
@@ -148,10 +145,7 @@ std::optional<Signal> ArbitragePath::evaluate(
             double rawGetQty = roundedSellQty * orderPrice;
             double endingQty = rawGetQty * (1.0 - feeRate);
 
-            order.setPrice(orderPrice);
-            order.setQty(roundedSellQty);
-            order.setType(OrderType::MARKET);
-
+            workingQtys_[leg] = roundedSellQty;
             currentAmount = endingQty;
         }
     }
@@ -159,7 +153,17 @@ std::optional<Signal> ArbitragePath::evaluate(
     const double pnl = currentAmount - initialStake;
 
     if (pnl > 0) [[unlikely]] {
-        return Signal(std::move(workingOrders), cachedDescription_, pnl);
+        // Only create orders vector when we actually have a signal
+        std::vector<Order> signalOrders;
+        signalOrders.reserve(3);
+        for (size_t leg = 0; leg < 3; ++leg) {
+            Order o = orders_[leg];
+            o.setPrice(workingPrices_[leg]);
+            o.setQty(workingQtys_[leg]);
+            o.setType(OrderType::MARKET);
+            signalOrders.push_back(std::move(o));
+        }
+        return Signal(std::move(signalOrders), cachedDescription_, pnl);
     }
 
     return std::nullopt;

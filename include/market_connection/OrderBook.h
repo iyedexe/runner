@@ -3,6 +3,7 @@
 #include <atomic>
 #include <array>
 #include <bitset>
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <condition_variable>
@@ -158,6 +159,8 @@ public:
         std::atomic_thread_fence(std::memory_order_release);
         slot.sequence.store(seq + 2, std::memory_order_release);
 
+        // Set atomic flag BEFORE acquiring mutex for lock-free fast-path
+        hasUpdatesAtomic_.store(true, std::memory_order_release);
         {
             std::lock_guard<std::mutex> lock(updateMtx_);
             updatedBits_.set(id);
@@ -238,20 +241,43 @@ public:
         std::bitset<MAX_SYMBOLS> result = updatedBits_;
         updatedBits_.reset();
         hasUpdates_ = false;
+        hasUpdatesAtomic_.store(false, std::memory_order_release);
+        return result;
+    }
+
+    /**
+     * Wait for updates with timeout for periodic shutdown checks.
+     * Returns empty bitset on timeout.
+     */
+    std::bitset<MAX_SYMBOLS> waitForUpdatesWithTimeout(std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(updateMtx_);
+        bool gotUpdate = updateCv_.wait_for(lock, timeout, [this] { return hasUpdates_; });
+
+        if (!gotUpdate) {
+            return std::bitset<MAX_SYMBOLS>();  // Timeout - return empty
+        }
+
+        std::bitset<MAX_SYMBOLS> result = updatedBits_;
+        updatedBits_.reset();
+        hasUpdates_ = false;
+        hasUpdatesAtomic_.store(false, std::memory_order_release);
         return result;
     }
 
     /**
      * Busy-poll for updates with spin limit.
+     * Uses lock-free atomic check to avoid mutex acquisition on every iteration.
      */
     std::bitset<MAX_SYMBOLS> waitForUpdatesSpin(int maxSpins = 10000) {
         for (int i = 0; i < maxSpins; ++i) {
-            {
+            // Fast-path: check atomic without lock
+            if (hasUpdatesAtomic_.load(std::memory_order_acquire)) {
                 std::lock_guard<std::mutex> lock(updateMtx_);
                 if (hasUpdates_) {
                     std::bitset<MAX_SYMBOLS> result = updatedBits_;
                     updatedBits_.reset();
                     hasUpdates_ = false;
+                    hasUpdatesAtomic_.store(false, std::memory_order_release);
                     return result;
                 }
             }
@@ -274,6 +300,7 @@ public:
         std::bitset<MAX_SYMBOLS> result = updatedBits_;
         updatedBits_.reset();
         hasUpdates_ = false;
+        hasUpdatesAtomic_.store(false, std::memory_order_release);
         return result;
     }
 
@@ -293,4 +320,5 @@ private:
     std::condition_variable updateCv_;
     std::bitset<MAX_SYMBOLS> updatedBits_;
     bool hasUpdates_ = false;
+    std::atomic<bool> hasUpdatesAtomic_{false};  // Lock-free fast-path check
 };

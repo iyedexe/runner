@@ -2,9 +2,11 @@
 
 #include <string>
 #include <map>
+#include <array>
 #include <optional>
 #include <stdexcept>
 #include "fin/SymbolFilters.h"
+#include "market_connection/OrderBook.h"  // For SymbolId, MAX_SYMBOLS, SymbolRegistry
 #include "logger.hpp"
 
 /**
@@ -62,6 +64,14 @@ public:
      */
     void addSymbol(const std::string& symbol, const SymbolFilters& filters) {
         filters_[symbol] = filters;
+
+        // Also populate the SymbolId-indexed array for O(1) lookups
+        SymbolId id = SymbolRegistry::instance().getId(symbol);
+        if (id != INVALID_SYMBOL_ID) {
+            filtersBySymbolId_[id] = &filters_[symbol];
+            hasFiltersBySymbolId_[id] = true;
+        }
+
         LOG_DEBUG("[OrderSizer] Added {}: lotStep={}, lotPrec={}, mktStep={}, mktPrec={}",
                  symbol,
                  filters.lotSize().stepSize, filters.lotSize().precision,
@@ -275,8 +285,43 @@ public:
     /**
      * Clear all symbols
      */
-    void clear() { filters_.clear(); }
+    void clear() {
+        filters_.clear();
+        filtersBySymbolId_.fill(nullptr);
+        hasFiltersBySymbolId_.fill(false);
+    }
+
+    // Fast-path methods using SymbolId for O(1) lookups
+
+    /**
+     * Check if symbol is registered (by SymbolId)
+     */
+    [[nodiscard]] bool hasSymbol(SymbolId id) const noexcept {
+        return hasFiltersBySymbolId_[id];
+    }
+
+    /**
+     * Round quantity using SymbolId for O(1) lookup
+     */
+    [[nodiscard]] double roundQuantity(SymbolId id, double quantity, bool isMarketOrder = false) const {
+        const auto* filters = filtersBySymbolId_[id];
+        if (!filters) {
+            return quantity;
+        }
+        return isMarketOrder ? filters->roundMarketQty(quantity) : filters->roundQty(quantity);
+    }
+
+    /**
+     * Get filters for a symbol (by SymbolId)
+     */
+    [[nodiscard]] const SymbolFilters* getFilters(SymbolId id) const noexcept {
+        return filtersBySymbolId_[id];
+    }
 
 private:
     std::map<std::string, SymbolFilters> filters_;
+
+    // Parallel arrays indexed by SymbolId for O(1) lookups
+    std::array<const SymbolFilters*, MAX_SYMBOLS> filtersBySymbolId_{};
+    std::array<bool, MAX_SYMBOLS> hasFiltersBySymbolId_{};
 };

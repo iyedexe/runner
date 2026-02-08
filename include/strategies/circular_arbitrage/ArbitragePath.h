@@ -95,6 +95,10 @@ private:
     // Validity flag
     bool pricesValid_ = false;
 
+    // Working buffers for allocation-free evaluate()
+    mutable std::array<double, 3> workingPrices_;
+    mutable std::array<double, 3> workingQtys_;
+
     void buildDescription();
 };
 

@@ -5,6 +5,7 @@
 #include <vector>
 #include <string>
 #include <stdexcept>
+#include <atomic>
 
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/ini_parser.hpp>
@@ -19,6 +20,7 @@
 #include "fin/SymbolFilters.h"
 #include "fin/OrderSizer.h"
 #include "fin/Symbol.h"
+#include "persistence/TradePersistence.h"
 
 // Exception thrown when arbitrage execution fails mid-way
 class ArbitrageExecutionError : public std::runtime_error {
@@ -62,6 +64,9 @@ struct RunnerConfig {
     PollingMode pollingMode = PollingMode::Hybrid;
     int busyPollSpinCount = 10000;
 
+    // Persistence settings
+    std::string tradeLogDir = "./trades";
+
     // Strategy config (nested)
     TriangularArbitrageConfig strategyConfig;
 };
@@ -84,6 +89,17 @@ public:
     void shutdown();
     void run();
 
+    /**
+     * Request graceful shutdown of the main loop.
+     * Thread-safe - can be called from signal handlers.
+     */
+    void requestShutdown() { shutdownRequested_.store(true, std::memory_order_release); }
+
+    /**
+     * Check if shutdown has been requested.
+     */
+    [[nodiscard]] bool isShutdownRequested() const { return shutdownRequested_.load(std::memory_order_acquire); }
+
     static RunnerConfig loadConfig(const std::string& configFile);
 
 private:
@@ -99,10 +115,16 @@ private:
     // Strategy
     std::unique_ptr<TriangularArbitrage> strategy_;
 
+    // Persistence
+    std::unique_ptr<TradePersistence> tradePersistence_;
+
     // State
     std::map<std::string, double> balance_;
     std::vector<fin::Symbol> symbolsList_;
     OrderSizer orderSizer_;
+
+    // Shutdown flag
+    std::atomic<bool> shutdownRequested_{false};
 
     void waitForMarketDataSnapshots();
     void executeArbitrage(const Signal& signal);
@@ -118,5 +140,25 @@ private:
         double feeRate;
     };
 
-    void handleExecutionFailure(int legIndex, const std::string& clOrdId, const std::string& reason);
+    // Executed order tracking for rollback purposes
+    struct ExecutedOrder {
+        std::string clOrdId;
+        std::string symbol;
+        char side;              // '1' = BUY, '2' = SELL
+        double filledQty;       // Actual filled quantity
+        double avgPrice;        // Average fill price
+    };
+
+    void handleExecutionFailure(int legIndex, const std::string& clOrdId, const std::string& reason,
+                                const std::vector<ExecutedOrder>& executedOrders);
+
+    /**
+     * Execute rollback orders for previously successful legs.
+     * For each executed order, sends the opposite order (BUY -> SELL, SELL -> BUY)
+     * using the actual filled quantity.
+     *
+     * @param executedOrders Vector of orders that were successfully executed
+     * @return true if all rollback orders succeeded, false if any failed
+     */
+    bool executeRollback(const std::vector<ExecutedOrder>& executedOrders);
 };

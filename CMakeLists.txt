@@ -28,6 +28,7 @@ set(TRADER_SOURCES
     src/market_connection/Admin.cpp
     src/market_connection/Feeder.cpp
     src/market_connection/Broker.cpp
+    src/persistence/TradePersistence.cpp
     src/Runner.cpp
     src/trader_main.cpp
 )
@@ -54,11 +55,15 @@ target_include_directories(trader PRIVATE
 )
 target_link_libraries(trader PRIVATE ${COMMON_LIBS})
 
+# Enable Link-Time Optimization for Release builds
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+endif()
+
 # Enable architecture-specific optimizations
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(trader PRIVATE
-        -march=native
-        -O3
-        -funroll-loops
+        $<$<CONFIG:Release>:-O3 -march=native -mtune=native -funroll-loops>
+        $<$<NOT:$<CONFIG:Release>>:-march=native -funroll-loops>
     )
 endif()
